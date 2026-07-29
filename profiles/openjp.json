@@ -65,12 +65,17 @@
     "level_paths": {
       "offset": "0x0190",
       "size": 1,
-      "description": "The level path templates. The game rewrites the level digit in these in place, so they change as levels load."
+      "description": "The level path templates. The game rewrites the level digit in these in place, so reading 'game\\lNN\\' here says which level is loaded."
     },
     "resource_name": {
       "offset": "0x4DA8",
       "size": 1,
       "description": "'RESOURCE.2D', passed to INT 21h AH=3D by the opener."
+    },
+    "live_palette": {
+      "offset": "0x3A60",
+      "size": 1,
+      "description": "Roughly where the live 768-byte 6-bit DAC sits; it MOVES between runs, so treat this as a hint and search. It is NOT the level's MAP.PAL -- the game builds its own and 688 of 768 bytes differ. Ten windows can cover the screen one-to-one and nine of them are shifted by whole DAC entries; only agreement with the level's MAP.BLK picks the right one. tools/capture_ground_truth.py does this."
     }
   }
 }

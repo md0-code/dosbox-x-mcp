@@ -1,0 +1,21 @@
+{
+  "name": "openjp",
+  "description": "Jurassic Park (Ocean, PC386 v1.31, 11/04/93) under DOSBox-X. INCOMPLETE: the data segment has not been located yet, so the marker below is a placeholder and every memory tool will report 'no data segment matching profile'. The screen tools do not use it and work now. To finish it: launch dosbox-x/jp2d.conf, run `python tools/find_guest_segment.py --search \"game\\spts\"` to find the segment the literal pool loaded into, dump that segment, choose 50-100 bytes of it that do not change between runs, and replace marker.offset/marker.bytes with them. Then add two or three cheap checks over fields with narrow domains, and set ds_segment.",
+  "window_title": "DOSBox-X",
+  "ds_segment": null,
+  "marker": {
+    "bytes": "67616d655c737074735c737072697465732e646274",
+    "offset": "0x0000",
+    "note": "'game\\spts\\sprites.dbt', a literal in JP2D.EXE at file offset 0x1a6ba. It is certainly somewhere in the loaded image; offset 0x0000 is a placeholder and is wrong, which is why nothing validates against it yet."
+  },
+  "checks": [],
+  "mouse": {
+    "note": "Unknown. The game reads the mouse through INT 33h; the words its handler leaves behind have not been located. Until they are, dosbox_click and dosbox_hold_buttons cannot work and keyboard injection is the only input route."
+  },
+  "screen": {
+    "width": 320,
+    "height": 200,
+    "note": "Inferred: a 1993 VGA action game with 256-colour .LBM art. Confirm from the first dosbox_view_screen capture before relying on it. No palette file yet, so dosbox_capture_screen must be called with exact=false."
+  },
+  "symbols": {}
+}

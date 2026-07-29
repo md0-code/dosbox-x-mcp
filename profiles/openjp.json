@@ -1,6 +1,6 @@
 {
   "name": "openjp",
-  "description": "Jurassic Park (Ocean, PC386 v1.31, 11/04/93) under DOSBox-X. INCOMPLETE: the data segment has not been located yet, so the marker below is a placeholder and every memory tool will report 'no data segment matching profile'. The screen tools do not use it and work now. To finish it: launch dosbox-x/jp2d.conf, run `python tools/find_guest_segment.py --search \"game\\spts\"` to find the segment the literal pool loaded into, dump that segment, choose 50-100 bytes of it that do not change between runs, and replace marker.offset/marker.bytes with them. Then add two or three cheap checks over fields with narrow domains, and set ds_segment.",
+  "description": "Jurassic Park (Ocean, PC386 v1.31 / front end V 1.32P, 11/04/93) under DOSBox-X. INCOMPLETE: the data segment has not been located yet, so the marker below is a placeholder and every memory tool reports 'no data segment matching profile'. NOTE the marker offset of 0 makes the scan self-validating and gives a false 'attached: true' -- do not trust it until a real marker replaces it. The screen tools work now. Driving: this game does NOT read the BIOS keyboard ring, so dosbox_send_keys stops working the moment the game takes the keyboard; use AUTOTYPE in the .conf, which goes through the emulated keyboard controller. See docs/GROUND_TRUTH.md.",
   "window_title": "DOSBox-X",
   "ds_segment": null,
   "marker": {
@@ -10,12 +10,12 @@
   },
   "checks": [],
   "mouse": {
-    "note": "Unknown. The game reads the mouse through INT 33h; the words its handler leaves behind have not been located. Until they are, dosbox_click and dosbox_hold_buttons cannot work and keyboard injection is the only input route."
+    "note": "The front end OPTIONS.OLD keeps pointer x at DS:0x21BF and y at DS:0x21C1, with the INT 33h AX=0 result at DS:0x21C7 and its data segment at load+0x2C0 (image 0x1A2F). Those are the front end's, not JP2D.EXE's. Under the current dosbox-x configs INT 33h reports no driver, so the game skips its mouse setup entirely and the menu cannot be clicked."
   },
   "screen": {
     "width": 320,
     "height": 200,
-    "note": "Inferred: a 1993 VGA action game with 256-colour .LBM art. Confirm from the first dosbox_view_screen capture before relying on it. No palette file yet, so dosbox_capture_screen must be called with exact=false."
+    "note": "Verified: the front end sets the INT 33h pointer range to 0..319 by 0..199 at OPTIONS.OLD image 0x1A49, so the mode is 320x200. No palette file yet, so dosbox_capture_screen must be called with exact=false; a decoded .PAL from the container is the obvious candidate."
   },
   "symbols": {}
 }

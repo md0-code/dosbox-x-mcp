@@ -1,21 +1,76 @@
 {
   "name": "openjp",
-  "description": "Jurassic Park (Ocean, PC386 v1.31 / front end V 1.32P, 11/04/93) under DOSBox-X. INCOMPLETE: the data segment has not been located yet, so the marker below is a placeholder and every memory tool reports 'no data segment matching profile'. NOTE the marker offset of 0 makes the scan self-validating and gives a false 'attached: true' -- do not trust it until a real marker replaces it. The screen tools work now. Driving: this game does NOT read the BIOS keyboard ring, so dosbox_send_keys stops working the moment the game takes the keyboard; use AUTOTYPE in the .conf, which goes through the emulated keyboard controller. See docs/GROUND_TRUTH.md.",
+  "description": "Jurassic Park 2D (Ocean, PC386 v1.31, 11/04/93) under DOSBox-X. The data segment is JP2D.EXE's load segment plus 0x19C4, which its own entry code sets with `mov ax,0x19c4; mov ds,ax`. It is recognised by 100 bytes of the sprite path table at DS:0x027A -- static, and unique in guest memory -- then confirmed by three fields. NOTE the game cannot be started on its own: JP2D.EXE looks up a named EMS handle GAMEEMS with INT 67h AX=5401 that JP.EXE creates, and exits silently without it. Launch dosbox-x/drive.conf, which goes through the launcher. Driving is by AUTOTYPE in the .conf: the game installs its own INT 9 handler and never reads the BIOS keyboard ring.",
   "window_title": "DOSBox-X",
-  "ds_segment": null,
+  "ds_segment": "0x2456",
   "marker": {
-    "bytes": "67616d655c737074735c737072697465732e646274",
-    "offset": "0x0000",
-    "note": "'game\\spts\\sprites.dbt', a literal in JP2D.EXE at file offset 0x1a6ba. It is certainly somewhere in the loaded image; offset 0x0000 is a placeholder and is wrong, which is why nothing validates against it yet."
+    "bytes": "67616d655c737074735c737072697465732e6462740067616d655c737074735c737072697465732e64626900675c616d6265722e62697400675c6a6e676c726170342e6269740067616d655c747261636b65722e64727600da020000e902f80267616d65",
+    "offset": "0x027A",
+    "note": "The sprite path table, 100 bytes from DS:0x027A. Static -- byte-identical between the shipped image and a running guest -- and it occurs exactly once in conventional memory. DS:0x0190's level paths look equally good and are not: the game rewrites the level number in them in place."
   },
-  "checks": [],
+  "checks": [
+    {
+      "kind": "equals",
+      "offset": "0x4A48",
+      "bytes": "47414d45454d5300",
+      "note": "'GAMEEMS\u0000', the EMS handle name JP2D looks up with INT 67h AX=5401"
+    },
+    {
+      "kind": "equals",
+      "offset": "0x4DA8",
+      "bytes": "5245534f555243452e324400",
+      "note": "'RESOURCE.2D\u0000', the container name the opener at 1e15:5A05 passes to INT 21h AH=3D"
+    },
+    {
+      "kind": "equals",
+      "offset": "0x4B22",
+      "bytes": "ffff",
+      "note": "the EMS-acquired flag set at 1000:4E2B; zero means the game is about to exit, so this also rejects a JP2D that was started without its launcher"
+    }
+  ],
   "mouse": {
-    "note": "The front end OPTIONS.OLD keeps pointer x at DS:0x21BF and y at DS:0x21C1, with the INT 33h AX=0 result at DS:0x21C7 and its data segment at load+0x2C0 (image 0x1A2F). Those are the front end's, not JP2D.EXE's. Under the current dosbox-x configs INT 33h reports no driver, so the game skips its mouse setup entirely and the menu cannot be clicked."
+    "note": "JP2D does not use the mouse; only the OPTIONS front end does, and its words are its own (x at DS:0x21BF, y at DS:0x21C1, INT 33h AX=0 result at DS:0x21C7, data segment load+0x2C0). dosbox_click is therefore not useful for the game."
   },
   "screen": {
     "width": 320,
     "height": 200,
     "note": "Verified: the front end sets the INT 33h pointer range to 0..319 by 0..199 at OPTIONS.OLD image 0x1A49, so the mode is 320x200. No palette file yet, so dosbox_capture_screen must be called with exact=false; a decoded .PAL from the container is the obvious candidate."
   },
-  "symbols": {}
+  "symbols": {
+    "ems_flag": {
+      "offset": "0x4B22",
+      "size": 2,
+      "description": "Non-zero once the GAMEEMS handle is found (1000:4E2B). Zero means the game will terminate."
+    },
+    "ems_pages": {
+      "offset": "0x4B24",
+      "size": 2,
+      "description": "EMS pages held, from INT 67h."
+    },
+    "ems_page_frame": {
+      "offset": "0x4B2C",
+      "size": 2,
+      "description": "EMS page-frame segment, from INT 67h AH=41."
+    },
+    "ems_handle": {
+      "offset": "0x4B2E",
+      "size": 2,
+      "description": "The EMS handle itself; 0xFFFF when none."
+    },
+    "sprite_paths": {
+      "offset": "0x027A",
+      "size": 1,
+      "description": "The sprite path table; the profile marker."
+    },
+    "level_paths": {
+      "offset": "0x0190",
+      "size": 1,
+      "description": "The level path templates. The game rewrites the level digit in these in place, so they change as levels load."
+    },
+    "resource_name": {
+      "offset": "0x4DA8",
+      "size": 1,
+      "description": "'RESOURCE.2D', passed to INT 21h AH=3D by the opener."
+    }
+  }
 }

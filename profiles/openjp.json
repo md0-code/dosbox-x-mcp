@@ -1,6 +1,6 @@
 {
   "name": "openjp",
-  "description": "Jurassic Park 2D (Ocean, PC386 v1.31, 11/04/93) under DOSBox-X. The data segment is JP2D.EXE's load segment plus 0x19C4, which its own entry code sets with `mov ax,0x19c4; mov ds,ax`. It is recognised by 100 bytes of the sprite path table at DS:0x027A -- static, and unique in guest memory -- then confirmed by three fields. NOTE the game cannot be started on its own: JP2D.EXE looks up a named EMS handle GAMEEMS with INT 67h AX=5401 that JP.EXE creates, and exits silently without it. Launch dosbox-x/drive.conf, which goes through the launcher. Driving is by AUTOTYPE in the .conf: the game installs its own INT 9 handler and never reads the BIOS keyboard ring.",
+  "description": "Jurassic Park 2D (Ocean, PC386 v1.31, 11/04/93) under DOSBox-X. The data segment is JP2D.EXE's load segment plus 0x19C4, which its own entry code sets with `mov ax,0x19c4; mov ds,ax`. It is recognised by 100 bytes of the sprite path table at DS:0x027A -- static, and unique in guest memory -- then confirmed by three fields. NOTE the game cannot be started on its own: JP2D.EXE first looks up the GAMEEMS handle that JP.EXE names with INT 67h AX=5401. Its fallback allocator does not set the launcher-handshake flag, so a standalone run still exits silently. Launch dosbox-x/drive.conf, which goes through the launcher. Driving is by AUTOTYPE in the .conf: the game installs its own INT 9 handler and never reads the BIOS keyboard ring.",
   "window_title": "DOSBox-X",
   "ds_segment": "0x2456",
   "marker": {
@@ -34,7 +34,7 @@
   "screen": {
     "width": 320,
     "height": 200,
-    "note": "Verified: the front end sets the INT 33h pointer range to 0..319 by 0..199 at OPTIONS.OLD image 0x1A49, so the mode is 320x200. No palette file yet, so dosbox_capture_screen must be called with exact=false; a decoded .PAL from the container is the obvious candidate."
+    "note": "Verified: the front end sets the INT 33h pointer range to 0..319 by 0..199 at OPTIONS.OLD image 0x1A49, so the mode is 320x200. The live DAC moves within the data segment between runs, so ordinary MCP screenshots remain non-exact; tools/capture_ground_truth.py discovers the correct live palette by agreement with the loaded level's MAP.BLK."
   },
   "symbols": {
     "ems_flag": {
@@ -76,6 +76,31 @@
       "offset": "0x3A60",
       "size": 1,
       "description": "Roughly where the live 768-byte 6-bit DAC sits; it MOVES between runs, so treat this as a hint and search. It is NOT the level's MAP.PAL -- the game builds its own and 688 of 768 bytes differ. Ten windows can cover the screen one-to-one and nine of them are shifted by whole DAC entries; only agreement with the level's MAP.BLK picks the right one. tools/capture_ground_truth.py does this."
+    },
+    "progression_step": {
+      "offset": "0x49B6",
+      "size": 2,
+      "description": "The progression step, 0-31. Set at 1000:4E45 from the shared block's first word minus one; (step >> 2) + 1 is the level directory. See docs/MECHANICS.md."
+    },
+    "shared_block": {
+      "offset": "0x2DB9",
+      "size": 93,
+      "description": "The 93-byte record every program in the chain shares through EMS logical page 0, JP.CFG on disk. +0 step+1, +2 request, +4 chain cursor, +6 password step, +12 password key (0x12345678), +32/+34 sound devices, +72 language, +74 nineteen scan codes."
+    },
+    "title_digit": {
+      "offset": "0x0326",
+      "size": 1,
+      "description": "The digit 1000:00A4 patches into 'game\\misc\\jpt1.bit', so it says which title picture is on screen. '2' and '9' are substituted because JPT2.BIT and JPT9.BIT are not shipped."
+    },
+    "key_bindings": {
+      "offset": "0x4963",
+      "size": 16,
+      "description": "Eight primary/alternate scan-code pairs: up, down, left, right, fire, then pause at 0x496D. The alternates ship as the extended arrow codes, which is what names them."
+    },
+    "key_state": {
+      "offset": "0x3179",
+      "size": 1,
+      "description": "One byte per scan code; bit 7 is down. 1000:3F2D ORs five pairs of bindings into the control byte at DS:0x49A4."
     }
   }
 }

@@ -1,0 +1,267 @@
+{
+  "name": "jp3d",
+  "description": "Jurassic Park 3D (Ocean, PC386 v1.31, 11/04/93) under DOSBox-X -- the first-person half of the game, JP3D.EXE. The data segment is JP3D.EXE's load segment plus 0xB99, which its own entry sets with `mov ax,<load>+0xb99; mov ds,ax`; the load segment is not fixed, so the segment is found by pattern rather than assumed. It is recognised by 100 bytes of the asset path literals at DS:0x0D39 -- shipped data, byte-identical between the recovered image and a running guest, and unique in conventional memory. NOTE the game cannot usefully be started on its own: like JP2D it wants the launcher's GAMEEMS handle and the 93-byte shared block, and without them PROGRAM keeps whatever the image ships and the section, language and sound devices are not the ones the chain would have chosen. Launch dosbox-x/jp3d_chain.conf after `python tools/chain_stub.py --step 0 --cursor 0x18 --write`, which stands in for the mouse-driven front end and resumes the launcher at its JP3D entry. Driving is by AUTOTYPE in the .conf: like JP2D, the game installs its own INT 9 handler and never reads the BIOS keyboard ring.",
+  "window_title": "DOSBox-X",
+  "ds_segment": "0x164F",
+  "marker": {
+    "bytes": "2e626c6b0062735c626c6f636b7365742e70616c00616e6d5c726170746f722e70616c00616e6d5c726170746f722e73707200204672616d657320506572205365636f6e642e0058526f7420203a0059526f7420203a00576f726c64583a00576f726c64",
+    "offset": "0x0D39",
+    "note": "The tail of the blockset name template, the two palette paths and the debug-overlay labels that follow them, 100 bytes from DS:0x0D39.  Static, and it occurs exactly once in conventional memory.  The level table's own map paths at DS:0x0050 look equally good and are not: their descriptors sit beside words the loader rewrites."
+  },
+  "checks": [
+    {
+      "kind": "equals",
+      "offset": "0xB681",
+      "bytes": "5245534f555243452e334400",
+      "note": "'RESOURCE.3D\\0', the container name the 3D game's opener passes to INT 21h AH=3D"
+    },
+    {
+      "kind": "equals",
+      "offset": "0x9452",
+      "bytes": "4461726b2e70616c004461792e70616c00",
+      "note": "'Dark.pal\\0Day.pal\\0', the two 57,344-byte shade tables 1000:5506 chooses between"
+    },
+    {
+      "kind": "equals",
+      "offset": "0x81AA",
+      "bytes": "0100",
+      "note": "the near plane, a constant no instruction writes; see docs/RENDER3D.md"
+    },
+    {
+      "kind": "equals",
+      "offset": "0x0050",
+      "bytes": "6d6170735c766973312e6d617000",
+      "note": "'maps\u000bis1.map\u0000', the first of the eleven map paths the sixteen-slot level table at DS:0x002C names. Read the geometry_segment symbol to tell whether the arena has actually run: it is zero until 1000:7160 has."
+    }
+  ],
+  "mouse": {
+    "note": "JP3D does not use the mouse; only the OPTIONS front end does. dosbox_click is not useful for the game."
+  },
+  "screen": {
+    "width": 320,
+    "height": 200,
+    "note": "Mode 13h, but the 3D view is only the middle 224x130 of it -- DS:0x8188 selects the viewport and ships zero, so the wide 304x184 arm is unreachable. The rest of the screen is lbm\\panel.bit. The renderer draws into the 65,536-byte arena buffer at DS:0xBEB8 and blits from there, so a mid-frame capture shows a whole frame rather than a partial one."
+  },
+  "symbols": {
+    "asset_paths": {
+      "offset": "0x0D39",
+      "size": 1,
+      "description": "The asset path table; the profile marker."
+    },
+    "resource_name": {
+      "offset": "0xB681",
+      "size": 1,
+      "description": "'RESOURCE.3D', passed to INT 21h AH=3D by the opener."
+    },
+    "program": {
+      "offset": "0x0013",
+      "size": 2,
+      "description": "The shared block's PROGRAM field, copied here only when the launcher supplied one. `and bx,7` picks one of the five sections."
+    },
+    "level": {
+      "offset": "0x002A",
+      "size": 2,
+      "description": "The current level index, an index into the sixteen-slot table at DS:0x002C. Eleven slots name a maps\\*.map."
+    },
+    "level_table": {
+      "offset": "0x002C",
+      "size": 32,
+      "description": "Sixteen descriptor offsets; the descriptor's first word is its body offset and the map path follows it."
+    },
+    "view_distance": {
+      "offset": "0x0E1C",
+      "size": 2,
+      "description": "How far a block may be and still be marked visible, in world units. 400, 700 or 2000 depending on the section; 1000:228B raises it to at least 1280 for the marking box."
+    },
+    "fog_base": {
+      "offset": "0x0E1A",
+      "size": 2,
+      "description": "Where the depth ramp at DS:0x0FAE starts. With the view distance it determines the whole 2,048-byte ramp; 1000:0AE5 builds it."
+    },
+    "depth_ramp": {
+      "offset": "0x0FAE",
+      "size": 1,
+      "description": "2,048 bytes of fog band per unit of view depth, 0..63. Built by 1000:0AE5, or by 1000:0FB7 in the section that sets a view distance of 2000."
+    },
+    "row_offsets": {
+      "offset": "0x0E1E",
+      "size": 400,
+      "description": "200 words of 64000 - 320 * row: the framebuffer offset of a screen row, counting up from the bottom. This is why the projected y axis points up."
+    },
+    "camera": {
+      "offset": "0x5D38",
+      "size": 16,
+      "description": "The camera block: world x and world y as 24.8 fixed point, then XRot, YRot, a dead word and YShift. 1000:11C3 snapshots all six to DS:0x5D4C."
+    },
+    "camera_snapshot": {
+      "offset": "0x5D4C",
+      "size": 16,
+      "description": "The frame's copy of the camera block. This, not DS:0x5D38, is what the transform reads."
+    },
+    "camera_integer": {
+      "offset": "0x5D5A",
+      "size": 6,
+      "description": "The three words 1000:2433 subtracts from every vertex: world y, eye height, world x -- in that order, which is the order the view matrix's rows act in."
+    },
+    "near_plane": {
+      "offset": "0x81AA",
+      "size": 2,
+      "description": "The near clip depth. A shipped constant, 1; no instruction writes it."
+    },
+    "eye_offset": {
+      "offset": "0x81AC",
+      "size": 2,
+      "description": "Added to every view depth before the perspective divide. A shipped constant, 19."
+    },
+    "reference_depth": {
+      "offset": "0x81AE",
+      "size": 2,
+      "description": "The depth the frustum's half-extents are measured at. A shipped constant, 2048."
+    },
+    "far_plane": {
+      "offset": "0x81A8",
+      "size": 2,
+      "description": "The far clip depth. Ships 2040 but 1000:0AEA installs 1900 before anything draws."
+    },
+    "viewport_selector": {
+      "offset": "0x8188",
+      "size": 2,
+      "description": "Chooses the 224x130 view or the 304x184 one, and the two lbm\\gameover.bit origins with it. Ships zero and no instruction writes it, so only the narrow arm is reachable."
+    },
+    "view_width": {
+      "offset": "0x818A",
+      "size": 2,
+      "description": "The view's width in pixels; 224 in the shipped build."
+    },
+    "view_height": {
+      "offset": "0x818C",
+      "size": 2,
+      "description": "The view's height in pixels; 130 in the shipped build."
+    },
+    "frustum_left": {
+      "offset": "0x17AE",
+      "size": 4096,
+      "description": "2,048 words of the left x limit, indexed by view depth minus the near plane. 1000:3E68 builds this and the three that follow it."
+    },
+    "frustum_right": {
+      "offset": "0x27AE",
+      "size": 4096,
+      "description": "2,048 words of the right x limit."
+    },
+    "frustum_lower": {
+      "offset": "0x37AE",
+      "size": 4096,
+      "description": "2,048 words of the lower y limit."
+    },
+    "frustum_upper": {
+      "offset": "0x47AE",
+      "size": 4096,
+      "description": "2,048 words of the upper y limit."
+    },
+    "sine_table": {
+      "offset": "0x6CEE",
+      "size": 2560,
+      "description": "1,280 words of round(0x7FFF * sin(2*pi*i/1024)). The cosine is the same table read 256 entries along, which is why it runs a quarter turn past the circle."
+    },
+    "view_matrix": {
+      "offset": "0x6C8E",
+      "size": 32,
+      "description": "The frame's 4x4 view matrix, 1.15 fixed point, eight-byte row stride. Only the upper 3x3 is used."
+    },
+    "visible_rooms": {
+      "offset": "0x76F0",
+      "size": 2,
+      "description": "How many rooms the frame will walk; the far pointers are at DS:0x7700, up to sixteen."
+    },
+    "room_list": {
+      "offset": "0x7700",
+      "size": 64,
+      "description": "Sixteen far pointers to rooms, 0xFFFFFFFF where unused."
+    },
+    "visible_blocks": {
+      "offset": "0x6C42",
+      "size": 2,
+      "description": "How many blocks 1000:2305 marked this frame."
+    },
+    "draw_list_count": {
+      "offset": "0x7822",
+      "size": 2,
+      "description": "How many polygons survived the culls and reached the sorted draw list at DS:0x7826."
+    },
+    "drawn_polygons": {
+      "offset": "0x7810",
+      "size": 2,
+      "description": "How many polygons 1000:3310 actually handed to a span routine."
+    },
+    "blockset_slots": {
+      "offset": "0x65CE",
+      "size": 256,
+      "description": "Blockset id to EMS slot, 0xFF where the blockset is not resident. Eighty slots, four to an EMS logical page."
+    },
+    "blockset_shade_rows": {
+      "offset": "0x66CE",
+      "size": 256,
+      "description": "Blockset id to a 256-byte row of the shade table at DS:0xBEBA. Shipped data; 0xFF means no ramp."
+    },
+    "blockset_see_through": {
+      "offset": "0xB504",
+      "size": 256,
+      "description": "Blockset id to a see-through flag. Shipped data with eleven entries set; those blocksets get the masked column drawer and let a closed door show the room beyond."
+    },
+    "detail_toggles": {
+      "offset": "0x59A0",
+      "size": 6,
+      "description": "Six debug toggles a key handler cycles: DS:0x59A2 shading (0..2), DS:0x59A3 texturing (0/1), DS:0x59A4 detail level (0..2). They ship 1,1,2,1,2,1."
+    },
+    "dark_mode": {
+      "offset": "0x0CCC",
+      "size": 2,
+      "description": "When set, a block's own light level at +0x12 is used instead of the flat 100. Ships zero."
+    },
+    "arena_table": {
+      "offset": "0xBE1E",
+      "size": 128,
+      "description": "Sixteen (size, destination) pairs, terminated by 0xFFFF. 1000:7160 allocates them out of one block in table order, so they are contiguous."
+    },
+    "map_header_segment": {
+      "offset": "0xBEBC",
+      "size": 2,
+      "description": "The map file's load segment. The solidity bitmap, the heights and the geometry follow it contiguously at +32, +2080 and +6176 paragraphs."
+    },
+    "solid_map_segment": {
+      "offset": "0xBEBE",
+      "size": 2,
+      "description": "The 32,768-byte one-bit-per-cell solidity map, 32 world units to the cell."
+    },
+    "height_map_segment": {
+      "offset": "0xBEC0",
+      "size": 2,
+      "description": "The 65,536-byte floor height map, 64 world units to the cell; bit 7 marks rough ground."
+    },
+    "geometry_segment": {
+      "offset": "0xBEC2",
+      "size": 2,
+      "description": "The geometry section: rooms, block lists, blocks and vertices. Every pointer inside it is a byte offset from the map's first byte."
+    },
+    "shade_table_segment": {
+      "offset": "0xBEBA",
+      "size": 2,
+      "description": "The 57,344-byte shade table, which is DARK.PAL or DAY.PAL loaded whole. 224 rows of 256."
+    },
+    "framebuffer_segment": {
+      "offset": "0xBEB8",
+      "size": 2,
+      "description": "The 65,536-byte buffer the span routines draw into before it is blitted to 0xA000."
+    },
+    "ems_page_frame": {
+      "offset": "0xBF52",
+      "size": 2,
+      "description": "The EMS page-frame segment. Blockset slot s is at logical page (s >> 2) + 4, offset (s & 3) * 4096."
+    },
+    "room_map_segment": {
+      "offset": "0xBE1C",
+      "size": 2,
+      "description": "The 128 x 128 coarse solidity map, built from the fine one by 1000:B2C5 rather than loaded."
+    }
+  }
+}

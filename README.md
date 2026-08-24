@@ -18,7 +18,7 @@ without changing a byte on disk.
 | **Find a guest** | Locate a DOS guest from BIOS invariants alone — no profile, no marker, nothing known in advance. Walk the DOS memory chain and name every loaded program, its segment and the path it came from. |
 | **Address any segment** | Another program in a launcher chain, a TSR, an overlay, the interrupt vector table, EMS pages. Read, patch, dump, search. |
 | **Drive it** | Keys into the BIOS keyboard ring. Clicks into the game's own post-INT-33h mouse words. Neither goes near the host's input queue. |
-| **See it** | Read the framebuffer straight out of the emulator's video memory: exact indices, no window, no scaling, no cost to the guest. Or photograph the window when you must. |
+| **See it** | Read the framebuffer straight out of the emulator's video memory: exact indices, no window, no scaling, no cost to the guest — confirmed against a reference frame. Or photograph the window when you must. |
 | **Measure it** | Block on a memory condition, or sample a watch list at up to 200 Hz into a TSV — every column from one snapshot, so they cannot drift apart. Watch video memory for every distinct frame and when it appeared. |
 | **Record it** | The emulator's own OPL, MIDI and WAVE capture, fired without focus and without the host mapper. |
 | **Instrument it** | Redirect a live `CALL` through a code cave that records registers and memory at every hit, then read it while the guest runs at full speed. Nothing on disk changes. |
@@ -41,9 +41,11 @@ Nothing here involves the host's input queue or screen.
   loses that race.
 * **Frames** come out of video memory. DOSBox stores a chain-4 page the way the
   hardware does — CPU offset `o` at linear `4 * (o & ~3) + (o & 3)` — so taking
-  every sixteenth group of four turns a region back into a screen. The page is
-  found either by matching a reference frame or by the fact that a drawn picture
-  is far more self-similar, horizontally and vertically, than unrelated memory.
+  every sixteenth group of four turns a region back into a screen. Finding
+  *which* bytes are the screen takes a reference frame: an emulator's memory is
+  full of picture-like data that is not the picture, so a page is either
+  confirmed byte for byte against a reference or reported as unconfirmed. See
+  [Reading the screen](#reading-the-screen).
 * **Traces** patch a near `CALL` to point at a run of zero padding. The cave
   calls the displaced target, preserves its flags, copies what you asked for
   into slots after its own code, and returns. The emulator dies with the run and
@@ -86,7 +88,11 @@ project root:
 | `DOSBOX_MCP_PROFILE_DIR` | where profiles live (default: the package's `profiles/`) |
 | `DOSBOX_MCP_PROFILE` | default profile name; `none` for no profile |
 | `DOSBOX_MCP_EXECUTABLE` | the `dosbox-x` binary to launch |
-| `DOSBOX_MCP_OUTPUT_DIR` | default directory for captures |
+| `DOSBOX_MCP_OUTPUT_DIR` | where a relative output or reference path is taken from |
+
+Every path a tool reads or writes follows one rule: absolute is taken as given,
+relative is under `DOSBOX_MCP_OUTPUT_DIR`. Tools return the resolved path, so
+there is never any doubt where a file went.
 
 ## Tools
 
@@ -140,6 +146,42 @@ dosbox_dump_segment(path="jp2d.bin", segment="0x2456")
 That dump is the profile's marker: pick 50–100 bytes of it that will not change
 between runs, add two or three cheap checks, and every DS-relative tool starts
 working by name.
+
+## Reading the screen
+
+`dosbox_read_framebuffer` returns the palette indices the guest wrote, at the
+instant of the read. It is exact, it cannot catch a half-drawn frame, and it
+costs the guest nothing — which is why it is the path to prefer for anything
+being measured.
+
+**It needs a reference frame, and it says so rather than guessing.** Locating
+the page means finding 64,000 bytes among hundreds of megabytes, and coherence
+alone is not enough: measured against a live game, a blind scan returned a page
+scoring 0.999 that was a decoded sprite bank, not the screen. So pass
+`reference=` a 64,000-byte file holding what is on screen right now, and the
+page is confirmed byte for byte:
+
+```
+dosbox_read_framebuffer(reference="credits_logo.bin", stem="shots/logo")
+   → page_offset 16, confirmed true, pages [16, 64016, 128016, 192016]
+```
+
+Where a reference comes from:
+
+* **A port under development has one for free** — its own render of the same
+  screen. That is also the comparison worth making: if the two agree byte for
+  byte, the port's renderer is right.
+* **Any earlier confirmed capture** of the same screen re-confirms it.
+* **A window photograph**, when the profile carries a palette — this is
+  automatic, and needs no argument.
+
+Once confirmed the location is cached, so every later read and every frame of
+`dosbox_watch_frames` is free. `allow_unconfirmed=true` takes the blind scan's
+guess for anyone who wants to check it themselves.
+
+The page is not necessarily where you would guess: it begins where the CRTC
+start address puts it, which is a four-byte boundary and nothing coarser. The
+one measured live sat at offset 16.
 
 ## Profiles
 
@@ -228,6 +270,8 @@ binary. There is no backend for it.
   that switches `DS`, capture `ds` alongside and check it.
 * Only chain-4 linear mode 13h is read out of video memory. Anything else needs
   `source="window"`.
+* A blind framebuffer scan is a hint, not an answer, and is reported as
+  unconfirmed. Give a reference frame.
 
 ## Development
 

@@ -134,6 +134,21 @@ def _condition(
     )
 
 
+def _output(path: str) -> Path:
+    """Where a tool writes.  One rule, so two tools never disagree about it.
+
+    A relative path is relative to ``DOSBOX_MCP_OUTPUT_DIR``, not to whatever
+    the server's working directory happens to be -- which is not knowable from
+    the caller's side.  Absolute paths are taken as given.  Every tool returns
+    the resolved path, so there is never any doubt where a file went.
+    """
+    target = Path(path)
+    if not target.is_absolute():
+        target = DEFAULT_OUTPUT_DIR / target
+    target.parent.mkdir(parents=True, exist_ok=True)
+    return target
+
+
 def _segment_number(value: int | str | None) -> int | None:
     """A guest segment, as a number or a 0x-string.  None means the profile's."""
     if value is None:
@@ -616,7 +631,10 @@ async def dosbox_write_memory(
     ),
 )
 async def dosbox_dump_segment(
-    path: Annotated[str, Field(description="Output file path.")],
+    path: Annotated[
+        str,
+        Field(description="Output file; a relative path goes under DOSBOX_MCP_OUTPUT_DIR."),
+    ],
     pid: int | None = None,
     segment: Annotated[
         int | str | None,
@@ -631,8 +649,7 @@ async def dosbox_dump_segment(
     else:
         data = await asyncio.to_thread(lambda: session.guest().read(where, 0, 0x10000))
         source = f"{where:04X}:0000"
-    target = Path(path).resolve()
-    target.parent.mkdir(parents=True, exist_ok=True)
+    target = _output(path)
     target.write_bytes(data)
     return {
         "pid": session.pid,
@@ -727,15 +744,12 @@ async def dosbox_capture_screen(
     ] = None,
 ) -> dict[str, Any]:
     session = _session(pid)
-    target = Path(stem)
-    if not target.is_absolute():
-        target = DEFAULT_OUTPUT_DIR / target
+    target = _output(stem)
 
     def from_vram() -> dict[str, Any]:
         found = _locate_framebuffer(session, reference)
         page = session.framebuffer().read()
         segment = session.segment() if with_segment else None
-        target.parent.mkdir(parents=True, exist_ok=True)
         written = [str(target.with_suffix(".rgb"))]
         target.with_suffix(".rgb").write_bytes(page)
         palette = vga.palette_bytes(session.profile.palette) if session.profile.palette else None
@@ -1062,10 +1076,7 @@ async def dosbox_read_framebuffer(
             "bytes": len(page),
         }
         if stem:
-            target = Path(stem)
-            if not target.is_absolute():
-                target = DEFAULT_OUTPUT_DIR / target
-            target.parent.mkdir(parents=True, exist_ok=True)
+            target = _output(stem)
             target.with_suffix(".bin").write_bytes(page)
             palette = (
                 vga.palette_bytes(session.profile.palette) if session.profile.palette else None
@@ -1124,10 +1135,7 @@ async def dosbox_watch_frames(
             "dropped": max(0, len(frames) - len(kept)),
         }
         if stem:
-            target = Path(stem)
-            if not target.is_absolute():
-                target = DEFAULT_OUTPUT_DIR / target
-            target.parent.mkdir(parents=True, exist_ok=True)
+            target = _output(stem)
             palette = (
                 vga.palette_bytes(session.profile.palette) if session.profile.palette else None
             )
@@ -1211,10 +1219,7 @@ async def dosbox_sample(
         result["changed"] = sorted(moved)
         result["constant"] = sorted({name for name, _, _ in fields} - moved)
         if out:
-            target = Path(out)
-            if not target.is_absolute():
-                target = DEFAULT_OUTPUT_DIR / target
-            target.parent.mkdir(parents=True, exist_ok=True)
+            target = _output(out)
             columns = result["columns"]
             with target.with_suffix(".tsv").open("w", encoding="ascii") as handle:
                 handle.write("\t".join(columns) + "\n")

@@ -708,8 +708,9 @@ async def dosbox_view_screen(
         "slow the guest.  source='window' photographs the window instead, "
         "resizing it to an integer multiple of the guest resolution; that is "
         "the one visible effect this server has on the desktop, and it costs "
-        "the guest real time.  'auto' takes video memory when the page can be "
-        "found and falls back to the window."
+        "the guest real time.  'auto' takes video memory when the page has been "
+        "CONFIRMED against a reference and falls back to the window otherwise, "
+        "so it never quietly saves the wrong 64,000 bytes."
     ),
 )
 async def dosbox_capture_screen(
@@ -720,6 +721,10 @@ async def dosbox_capture_screen(
     with_segment: Annotated[bool, Field(description="Also dump the data segment from the same instant.")] = True,
     settle_seconds: Annotated[float, Field(ge=0, le=30, description="Wait for the window to finish resizing.")] = 4.0,
     source: Literal["auto", "vram", "window"] = "auto",
+    reference: Annotated[
+        str | None,
+        Field(description="Path to a 64,000-byte frame on screen now; confirms a vram capture."),
+    ] = None,
 ) -> dict[str, Any]:
     session = _session(pid)
     target = Path(stem)
@@ -727,7 +732,7 @@ async def dosbox_capture_screen(
         target = DEFAULT_OUTPUT_DIR / target
 
     def from_vram() -> dict[str, Any]:
-        found = _locate_framebuffer(session)
+        found = _locate_framebuffer(session, reference)
         page = session.framebuffer().read()
         segment = session.segment() if with_segment else None
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -953,17 +958,52 @@ def _reference_from_window(session: Session) -> bytes | None:
     return capture.indices
 
 
-def _locate_framebuffer(session: Session) -> vga.Located:
+def _load_reference(session: Session, reference: str | None) -> bytes | None:
+    """A reference frame: from a file, or photographed off the window."""
+    if reference:
+        path = Path(reference)
+        if not path.is_absolute():
+            path = DEFAULT_OUTPUT_DIR / path
+        if not path.is_file():
+            raise SessionError(f"no reference frame at {path}")
+        raw = path.read_bytes()
+        wanted = session.profile.screen_width * session.profile.screen_height
+        if len(raw) != wanted:
+            raise SessionError(
+                f"a reference is {wanted} bytes, one palette index per pixel; "
+                f"{path} is {len(raw)}"
+            )
+        return raw
+    if host.capabilities().window_capture:
+        return _reference_from_window(session)
+    return None
+
+
+def _locate_framebuffer(
+    session: Session, reference: str | None = None, allow_unconfirmed: bool = False
+) -> vga.Located:
+    """Find the page, preferring a reference and saying so when there is none."""
     buffer = session.framebuffer()
-    if buffer.found is not None:
+    if buffer.found is not None and (buffer.found.confirmed or allow_unconfirmed):
         return buffer.found
-    reference = _reference_from_window(session) if host.capabilities().window_capture else None
-    try:
-        return buffer.locate(reference)
-    except vga.VgaError:
-        if reference is None:
-            raise
-        return buffer.locate(None)
+    anchor = _load_reference(session, reference)
+    if anchor is not None:
+        try:
+            return buffer.locate(anchor)
+        except vga.VgaError:
+            if not allow_unconfirmed:
+                raise
+    if not allow_unconfirmed:
+        raise vga.VgaError(
+            "the page could not be confirmed.  A blind scan finds the most "
+            "picture-like page in the emulator's memory, and on a real guest "
+            "that is often a sprite bank or an offscreen buffer rather than the "
+            "screen -- one measured against a live game scored 0.999 and was "
+            "wrong.  Give reference= a 64,000-byte frame of what is on screen "
+            "(a port's own render of it is ideal), or pass "
+            "allow_unconfirmed=true to take the guess and check it yourself."
+        )
+    return buffer.locate(None)
 
 
 @mcp.tool(
@@ -973,7 +1013,14 @@ def _locate_framebuffer(session: Session) -> vga.Located:
         "the palette indices the guest wrote, at the instant of the read, with "
         "no window, no scaling and no palette round trip.  Prefer this over "
         "dosbox_capture_screen for anything quantitative -- photographing the "
-        "window costs the guest real time and can catch a half-drawn frame.  "
+        "window costs the guest real time and can catch a half-drawn frame.\n\n"
+        "FINDING THE PAGE NEEDS A REFERENCE.  Give reference= a 64,000-byte "
+        "frame of what is on screen and the page is confirmed byte for byte; "
+        "without one this refuses, because a blind scan finds the most "
+        "picture-like page in memory and on a real guest that is often a "
+        "sprite bank or an offscreen buffer.  Once confirmed the location is "
+        "cached and every later read is free.  allow_unconfirmed=true takes "
+        "the guess anyway.\n\n"
         "Writes <stem>.bin (one byte per pixel) and <stem>.png when stem is "
         "given.  A page-flipping game has more than one page; pass page_offset "
         "from the pages list to read the other."
@@ -991,13 +1038,20 @@ async def dosbox_read_framebuffer(
     relocate: Annotated[
         bool, Field(description="Search for the page again rather than reusing the cached one.")
     ] = False,
+    reference: Annotated[
+        str | None,
+        Field(description="Path to a 64,000-byte frame of what is on screen, to confirm the page."),
+    ] = None,
+    allow_unconfirmed: Annotated[
+        bool, Field(description="Accept an unconfirmed blind scan; check the result yourself.")
+    ] = False,
 ) -> dict[str, Any]:
     session = _session(pid)
 
     def read() -> dict[str, Any]:
         if relocate:
             session.framebuffer().found = None
-        found = _locate_framebuffer(session)
+        found = _locate_framebuffer(session, reference, allow_unconfirmed)
         buffer = session.framebuffer()
         page = buffer.read(page_offset)
         result: dict[str, Any] = {
@@ -1051,11 +1105,16 @@ async def dosbox_watch_frames(
     pid: int | None = None,
     interval_seconds: Annotated[float, Field(ge=0.005, le=1.0)] = 0.02,
     max_frames: Annotated[int, Field(ge=1, le=2000)] = 200,
+    reference: Annotated[
+        str | None,
+        Field(description="Path to a 64,000-byte frame on screen now, to confirm the page."),
+    ] = None,
+    allow_unconfirmed: Annotated[bool, Field(description="Accept an unconfirmed blind scan.")] = False,
 ) -> dict[str, Any]:
     session = _session(pid)
 
     def watch() -> dict[str, Any]:
-        _locate_framebuffer(session)
+        _locate_framebuffer(session, reference, allow_unconfirmed)
         frames = session.framebuffer().watch(seconds, interval_seconds)
         kept = frames[:max_frames]
         result: dict[str, Any] = {

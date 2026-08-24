@@ -225,18 +225,32 @@ def test_the_page_is_found_by_a_reference_and_read_back():
     put_page(process, process.base + 0x40000, page)
     buffer = vga.Framebuffer(process)
     found = buffer.locate(page)
-    assert found.matched_reference and found.page_offset == 0x10000
+    assert found.confirmed and found.page_offset == 0x10000
     assert buffer.read() == page
 
 
-def test_the_page_is_found_without_a_reference_at_all():
+def test_a_blind_scan_finds_a_picture_and_admits_it_is_unconfirmed():
     page = draw(seed=3)
     memory = bytearray(0x100000)
     process = FakeProcess(memory)
     put_page(process, process.base, page)
+    found = vga.Framebuffer(process).locate(None)
+    assert found.coherence > vga.COHERENCE_FLOOR
+    # Measured against a live guest, a blind scan returned a 0.999-scoring page
+    # that was not the screen.  Saying so is the contract.
+    assert not found.confirmed
+    assert "UNCONFIRMED" in found.as_dict()["note"]
+
+
+def test_a_page_at_an_unaligned_offset_is_still_found():
+    """The measured live offset was 16, not 0 and not a multiple of the page."""
+    page = draw(seed=5)
+    memory = bytearray(0x100000)
+    process = FakeProcess(memory)
+    put_page(process, process.base + 16 * 4, page)
     buffer = vga.Framebuffer(process)
-    found = buffer.locate(None)
-    assert not found.matched_reference and found.coherence > vga.COHERENCE_FLOOR
+    found = buffer.locate(page)
+    assert found.confirmed and found.page_offset == 16
     assert buffer.read() == page
 
 

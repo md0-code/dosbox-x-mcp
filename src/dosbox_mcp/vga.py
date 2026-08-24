@@ -20,14 +20,32 @@ consecutive screen bytes are contiguous and the next twelve linear bytes belong
 to nothing.  Taking every sixteenth group of four turns a region back into a
 screen.
 
-**Finding the page.**  With a reference frame -- one the caller already has,
-or one photographed from the window a moment earlier -- the page is found by
-searching for a single row of it, which is exact.  Without one it is found by
-what makes a picture a picture: adjacent pixels in a drawn frame agree with
-each other far more often than bytes in unrelated memory do, horizontally and
-vertically at once.  The two tests together separate a real page from garbage
-by two orders of magnitude, and the score is reported so a caller can judge
-rather than trust.
+**Finding the page.**  With a reference frame the page is found by searching
+for a single row of it and confirming all 64,000 bytes, which is exact.  That
+is the path to prefer, and a port under development always has a reference: its
+own render of the same screen.
+
+Without one the page is found by what makes a picture a picture -- adjacent
+pixels in a drawn frame agree with each other far more often than bytes in
+unrelated memory do, horizontally and vertically at once -- scanned across
+*every* four-byte-aligned offset in the region.  Scanning every offset is not
+optional: a real page is where the CRTC start address puts it, which is a
+multiple of four bytes and nothing more.  Measured against a live DOSBox-X the
+page sat at offset **16**, so a scan that assumed page alignment found nothing
+and a scan that assumed row alignment would have missed it too.
+
+**The blind scan is a hint, not an answer, and says so.**  Measured against a
+live DOSBox-X running a real game it returned a page scoring 0.999 that was not
+the screen: an emulator's memory holds plenty of picture-like data that is not
+the picture -- decoded sprite banks, a previous frame, the game's own offscreen
+buffers.  Coherence cannot tell those from the front buffer, because they are
+all pictures.
+
+So a location is either **confirmed** -- every one of the 64,000 bytes equalled
+a reference -- or it is not, and :attr:`Located.confirmed` is what says which.
+Prefer a reference always.  A port under development has one for free: its own
+render of the same screen.  Failing that, any earlier confirmed capture of the
+same screen will re-confirm it.
 """
 from __future__ import annotations
 
@@ -48,6 +66,10 @@ MAX_REGION = 0x4000000
 #: Mode 13h page-flipping moves the CRTC start address in dwords, so successive
 #: pages sit one page-size apart in de-interleaved (CPU) space.
 MAX_PAGES = 4
+
+#: The CRTC start address is in dwords, so a page begins on a four-byte
+#: boundary of de-interleaved memory and on no coarser one.
+PAGE_ALIGNMENT = 4
 
 #: Below this, a candidate is not a drawn frame.  A real game screen scores
 #: 0.3 to 0.9; unrelated memory scores about 1/256.
@@ -121,6 +143,42 @@ def coherence(page: bytes, width: int = WIDTH, stride: int = 7) -> float:
     return min(horizontal, vertical) / samples
 
 
+def _agreement(flat: bytes, width: int):
+    """Prefix sums of "equals the next byte" and "equals the byte a row down".
+
+    One pass over the region buys a constant-time score for every candidate
+    offset afterwards, which is what makes scanning all of them affordable.
+    numpy does it quickly; ``accumulate`` does it acceptably.
+    """
+    try:
+        import numpy as np
+
+        data = np.frombuffer(flat, dtype="u1")
+        horizontal = np.zeros(len(data) + 1, dtype="i8")
+        vertical = np.zeros(len(data) + 1, dtype="i8")
+        np.cumsum(data[:-1] == data[1:], out=horizontal[2:])
+        np.cumsum(data[:-width] == data[width:], out=vertical[width + 1 :])
+        return horizontal, vertical
+    except ImportError:
+        pass
+    from array import array
+    from itertools import accumulate, chain
+
+    def prefix(pairs, lead: int):
+        return array(
+            "l",
+            accumulate(chain((0,) * (lead + 1), pairs)),
+        )
+
+    horizontal = prefix(
+        (1 if a == b else 0 for a, b in zip(flat[:-1], flat[1:])), 1
+    )
+    vertical = prefix(
+        (1 if a == b else 0 for a, b in zip(flat[:-width], flat[width:])), width
+    )
+    return horizontal, vertical
+
+
 def busiest_row(page: bytes, width: int = WIDTH, height: int = HEIGHT) -> int:
     """The row of a reference with the most non-zero bytes -- the best needle."""
     best, row = -1, 0
@@ -142,7 +200,12 @@ class Located:
     region_size: int
     page_offset: int          # in de-interleaved (CPU) bytes
     coherence: float
-    matched_reference: bool
+    confirmed: bool           # every byte equalled a reference
+
+    #: Kept for callers that spelled it the old way.
+    @property
+    def matched_reference(self) -> bool:
+        return self.confirmed
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -150,7 +213,14 @@ class Located:
             "region_bytes": self.region_size,
             "page_offset": self.page_offset,
             "coherence": round(self.coherence, 4),
-            "matched_reference": self.matched_reference,
+            "confirmed": self.confirmed,
+            "note": (
+                "every byte matched the reference"
+                if self.confirmed
+                else "UNCONFIRMED: the most picture-like page found, which on a real "
+                "guest is often a sprite bank or an offscreen buffer rather than "
+                "the screen.  Pass a reference frame to confirm it."
+            ),
         }
 
 
@@ -202,8 +272,9 @@ class Framebuffer:
                     "same moment."
                     if reference is not None
                     else "Nothing in memory scores as a drawn frame; the guest may be "
-                    "in text mode, or showing a blank screen.  Pass a reference "
-                    "frame, or use dosbox_capture_screen with source='window'."
+                    "in text mode, or showing a blank screen.  A reference frame is "
+                    "the reliable way in -- if a port of the game is being written, "
+                    "its own render of the same screen is one."
                 )
             )
         self.found = best
@@ -223,20 +294,35 @@ class Framebuffer:
         return None
 
     def _score(self, flat: bytes, base: int, size: int) -> Located | None:
+        """The most picture-like page in this region, over every valid offset.
+
+        Every four-byte-aligned offset is tried, which is only affordable
+        because the two agreement tests are computed once for the whole region
+        and then summed over a window in constant time.
+        """
+        if len(flat) < self.page + self.width + 1:
+            return None
+        horizontal, vertical = _agreement(flat, self.width)
         best: Located | None = None
-        for index in range(MAX_PAGES):
-            start = index * self.page
-            if start + self.page > len(flat):
-                break
-            page = flat[start : start + self.page]
-            distinct = len(set(page[::13]))
-            if distinct < 3:  # a cleared page is coherent and says nothing
+        span = self.page
+        limit = len(flat) - span
+        for start in range(0, limit + 1, PAGE_ALIGNMENT):
+            same_h = horizontal[start + span] - horizontal[start]
+            if same_h < span * COHERENCE_FLOOR:
                 continue
-            score = coherence(page, self.width)
+            same_v = vertical[start + span] - vertical[start]
+            score = min(same_h, same_v) / span
             if score < COHERENCE_FLOOR:
                 continue
-            if best is None or score > best.coherence:
-                best = Located(base, size, start, score, False)
+            # Ties go to the lowest offset -- the first page.  A score has to
+            # beat the incumbent by more than noise to displace it, or a
+            # picture with repeating structure picks an arbitrary row.
+            if best is not None and score <= best.coherence * 1.01:
+                continue
+            # A cleared page agrees with itself perfectly and says nothing.
+            if len(set(flat[start : start + span : 13])) < 3:
+                continue
+            best = Located(base, size, start, score, False)
         return best
 
     # -- reading -----------------------------------------------------------

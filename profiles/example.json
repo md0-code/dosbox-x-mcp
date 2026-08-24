@@ -1,0 +1,57 @@
+{
+  "name": "example",
+  "description": "A worked template.  Copy it, point it at a game, and delete the notes.  Everything except `name` and `marker` is optional: a profile with only those two makes every memory tool work, and the rest is convenience on top.  For a real one written against a shipped 1993 game, see the OpenJP repository's dosbox-x/profiles/.",
+
+  "window_title": "DOSBox-X",
+
+  "_ds_segment": "The guest segment the game keeps its data at, as the game's own entry code sets it.  Used to derive guest physical zero from the located segment.  If it is absent or wrong the server finds the BIOS data area by signature instead, so nothing is lost -- it is a shortcut, not a requirement.",
+  "ds_segment": "0x1234",
+
+  "_marker": "How to recognise the data segment: a run of bytes that is there every run and is unique in guest memory.  50 to 100 bytes of a static table -- file paths, a string pool, a jump table -- is the reliable choice.  Give it inline as `bytes` (hex), or as `source_dump` + `length` to slice it out of a dump captured with dosbox_dump_segment.  There is no third option: guessing a marker is how a patch lands in a random allocation.",
+  "marker": {
+    "bytes": "6578616d706c652e64617400",
+    "offset": "0x0100"
+  },
+
+  "_checks": "Cheap confirmations over fields with narrow domains, run after the marker matches.  Two or three make a false positive vanishingly unlikely, which matters because the alternative is patching whatever else happened to contain the pattern.  Kinds: cstring_via_pointer, max, max_range, equals.",
+  "checks": [
+    { "kind": "cstring_via_pointer", "pointer": "0x0200", "value": "game" },
+    { "kind": "max", "offset": "0x0300", "value": 16 },
+    { "kind": "max_range", "start": "0x0400", "end": "0x0410", "value": 63 }
+  ],
+
+  "_mouse": "Where the game keeps the mouse state its own INT 33h handler fills in -- the words it actually reads, not the driver's.  Without these dosbox_click and dosbox_hold_buttons refuse; everything else works.",
+  "mouse": {
+    "buttons": "0x00B2",
+    "position": "0x00B6"
+  },
+
+  "_screen": "Guest resolution, and optionally a palette to turn indices into colour.  A palette file sits beside the profile and is 768 bytes: `rgb6` for the six-bit values the VGA DAC holds, `rgb8` for ordinary bytes.  Without one, frames come back as indices and PNGs as grey, which loses nothing an exact capture needs.  Do NOT use the palette file a game ships: most build their DAC at runtime, and the file can differ from what is on screen in almost every byte.  Dump the live DAC out of the guest instead, or leave this out.",
+  "screen": {
+    "width": 320,
+    "height": 200
+  },
+
+  "_video": "How the guest draws.  Only chain-4 linear mode 13h is read out of video memory today; anything else should use source='window'.  code_segment_offset names the segment the trace tools default to.",
+  "video": {
+    "mode": "13h",
+    "code_segment_offset": "0x1000"
+  },
+
+  "_symbols": "Named offsets.  Anywhere an offset is accepted a symbol name works instead, which is what makes a session readable six months later.",
+  "symbols": {
+    "lives": { "offset": "0x1234", "size": 1, "description": "Lives left, 0 to 5." },
+    "score": { "offset": "0x1236", "size": 4, "description": "Score, BCD." },
+    "level": { "offset": "0x123A", "size": 1, "description": "Current level, 1-based." }
+  },
+
+  "_watch_sets": "Named lists for dosbox_sample, so a watch list is written once rather than retyped per call.  Entries are symbol names or raw offsets.",
+  "watch_sets": {
+    "player": ["lives", "score", "level"]
+  },
+
+  "_caves": "Runs of zero in the code segment known to be safe for a trace cave.  dosbox_find_cave discovers these at runtime; recording the good ones here saves the search and documents which were verified.",
+  "caves": [
+    { "segment": "0x1000", "offset": "0x4AE0", "length": 128, "note": "Padding between two routines; zero in every shipped build." }
+  ]
+}

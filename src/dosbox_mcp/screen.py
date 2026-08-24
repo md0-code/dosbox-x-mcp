@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .profile import Profile
-from .win32 import grab_client, resize_client
+from .platform import grab_client, resize_client
 
 
 class CaptureError(RuntimeError):

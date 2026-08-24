@@ -1,16 +1,43 @@
 [project]
-name = "dosbox-mcp"
-version = "0.1.0"
-description = "MCP server for driving a DOSBox-X guest headlessly: keys, clicks, memory and exact frame capture"
+name = "dosbox-x-mcp"
+version = "0.2.0"
+description = "MCP server for driving a DOSBox-X guest headlessly: guest memory, exact frames, live instrumentation. A general DOS reverse-engineering aid."
+readme = "README.md"
 requires-python = ">=3.11"
+license = { text = "MIT" }
+keywords = ["mcp", "dosbox", "dos", "reverse-engineering", "emulator", "8086"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Software Development :: Disassemblers",
+    "Topic :: System :: Emulators",
+]
 dependencies = [
     "mcp>=1.9",
-    "pillow>=10",
     "pydantic>=2",
 ]
 
+[project.optional-dependencies]
+# Photographing the emulator's window.  Not needed to read the framebuffer out
+# of video memory, which is the better path anyway.
+window = ["pillow>=10"]
+# The chain-4 de-interleave has a pure-Python fallback; numpy makes it quick.
+fast = ["numpy>=1.24"]
+# Listing and photographing windows on Linux.  Every memory tool works without it.
+x11 = ["python-xlib>=0.33"]
+all = ["pillow>=10", "numpy>=1.24", "python-xlib>=0.33"]
+dev = ["pytest>=8"]
+
+[project.urls]
+Homepage = "https://github.com/md0-code/dosbox-x-mcp"
+Issues = "https://github.com/md0-code/dosbox-x-mcp/issues"
+
 [project.scripts]
-dosbox-mcp = "dosbox_mcp.server:main"
+dosbox-x-mcp = "dosbox_mcp.server:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -18,3 +45,6 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/dosbox_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

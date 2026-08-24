@@ -1,12 +1,18 @@
 """Attached emulator sessions: find the guest's memory, then drive it.
 
-A session binds one DOSBox-X process id to one profile.  On first use it scans
+A session binds one DOSBox-X process id to one profile -- or to no profile at
+all, which is how a game nobody has described yet still gets driven.  On first use it scans
 host memory for the profile's marker, validates the candidate segment, and
 caches where it landed -- both the data segment and the guest's physical zero,
 which is what the BIOS keyboard buffer is addressed from.  Every later call
 revalidates the cached address in one small read and only rescans if the
 emulator moved (it does not, in practice, but a stale write into a moved
 allocation would be silent and terrible).
+
+Guest physical zero is found by :mod:`dosbox_mcp.guest` from invariants every
+DOS guest has, so it does not depend on the profile at all.  With it, any
+segment is addressable; without a profile there is simply no *named* segment,
+and the DS-relative calls say so rather than guessing.
 """
 from __future__ import annotations
 
@@ -14,8 +20,10 @@ import struct
 import time
 from dataclasses import dataclass, field
 
+from . import guest as dosguest
+from .platform import Process, ProcessError, Window, find_windows
 from .profile import SEGMENT_SIZE, Profile, ProfileError
-from .win32 import Process, ProcessError, Window, find_windows
+from .vga import Framebuffer
 
 BDA_BASE = 0x0400
 KEYBOARD_HEAD = 0x001A
@@ -131,7 +139,11 @@ class Session:
     ram_base: int | None = None
     scans: int = 0
     attached_at: float = field(default_factory=time.time)
+    display: object | None = None
+    config: object | None = None
+    traces: dict = field(default_factory=dict)
     _process: Process | None = None
+    _framebuffer: Framebuffer | None = None
 
     # ── plumbing ───────────────────────────────────────────────────────────
 
@@ -154,8 +166,15 @@ class Session:
     # ── locating the guest ─────────────────────────────────────────────────
 
     def locate(self, rescan: bool = False) -> None:
-        """Ensure ``ds_base`` points at a segment that still validates."""
+        """Ensure the guest is found, and the data segment still validates."""
         process = self.process()
+        if self.profile.anonymous_profile:
+            if self.ram_base is not None and not rescan:
+                if dosguest.plausible(process, self.ram_base):
+                    return
+            self.ram_base = dosguest.find_one(process)
+            self.scans += 1
+            return
         if self.ds_base and not rescan:
             segment = process.read(self.ds_base, SEGMENT_SIZE)
             if segment is not None and self.profile.validates(segment):
@@ -163,6 +182,35 @@ class Session:
         self.ds_base = self._scan(process)
         self.ram_base = self._find_ram_base(process, self.ds_base)
         self.scans += 1
+
+    # ── the guest, as the guest addresses itself ───────────────────────────
+
+    def guest(self) -> dosguest.Guest:
+        """Guest physical memory, for any segment rather than just the named one."""
+        self.locate()
+        if self.ram_base is None:
+            raise SessionError(
+                "the guest's physical memory could not be located, so only the "
+                "profile's own data segment is reachable.  Set ds_segment in the "
+                "profile to the game's runtime DS, or attach with no profile to "
+                "search for the guest directly."
+            )
+        return dosguest.Guest(process=self.process(), ram_base=self.ram_base)
+
+    def framebuffer(self) -> Framebuffer:
+        if self._framebuffer is None:
+            self._framebuffer = Framebuffer(
+                self.process(), self.profile.screen_width, self.profile.screen_height
+            )
+        return self._framebuffer
+
+    def _require_named_segment(self, what: str) -> None:
+        if self.profile.anonymous_profile:
+            raise SessionError(
+                f"{what} needs a profile: with none attached there is no named data "
+                f"segment.  Pass segment= to address the guest directly, or write a "
+                f"profile (dosbox_find_guest shows what is loaded and where)."
+            )
 
     def _scan(self, process: Process) -> int:
         candidates: list[int] = []
@@ -198,7 +246,7 @@ class Session:
             base, _, allocation = region
             tried.extend(value for value in (allocation, base) if value)
         for candidate in tried:
-            if candidate <= ds_base and self._bda_plausible(process, candidate):
+            if candidate <= ds_base and dosguest.plausible(process, candidate):
                 return candidate
         # Last resort: find the BIOS keyboard buffer start/end words (0x001E,
         # 0x003E at absolute 0x480) below the segment.
@@ -208,31 +256,15 @@ class Session:
             position = span.rfind(b"\x1e\x00\x3e\x00")
             while position >= 0:
                 candidate = window_start + position - 0x480
-                if self._bda_plausible(process, candidate):
+                if dosguest.plausible(process, candidate):
                     return candidate
                 position = span.rfind(b"\x1e\x00\x3e\x00", 0, position)
         return None
 
-    def _bda_plausible(self, process: Process, ram_base: int) -> bool:
-        if ram_base < 0:
-            return False
-        bda = process.read(ram_base + BDA_BASE, 0x100)
-        if bda is None:
-            return False
-        start, end = struct.unpack_from("<HH", bda, 0x80)
-        if (start, end) != (KEYBOARD_START, KEYBOARD_END):
-            return False
-        head, tail = struct.unpack_from("<H", bda, KEYBOARD_HEAD)[0], struct.unpack_from(
-            "<H", bda, KEYBOARD_TAIL
-        )[0]
-        return all(
-            KEYBOARD_START <= value < KEYBOARD_END and value % 2 == 0
-            for value in (head, tail)
-        )
-
     # ── memory ─────────────────────────────────────────────────────────────
 
     def segment(self) -> bytes:
+        self._require_named_segment("reading the data segment")
         self.locate()
         data = self.process().read(self.ds_base, SEGMENT_SIZE)
         if data is None:
@@ -240,6 +272,7 @@ class Session:
         return data
 
     def read(self, offset: int, length: int) -> bytes:
+        self._require_named_segment("reading the data segment")
         self.locate()
         if offset + length > SEGMENT_SIZE:
             raise ProfileError(
@@ -251,6 +284,7 @@ class Session:
         return data
 
     def write(self, offset: int, data: bytes) -> None:
+        self._require_named_segment("writing the data segment")
         self.locate()
         if offset + len(data) > SEGMENT_SIZE:
             raise ProfileError(
@@ -269,37 +303,14 @@ class Session:
                 "injected.  Set ds_segment in the profile to the game's runtime DS "
                 "(the segment its data lives at) and retry."
             )
-        process = self.process()
+        target = self.guest()
         report: list[str] = []
         for index, key in enumerate(keys):
             ascii_code, scan_code = key_codes(key)
-            bda = process.read(self.ram_base + BDA_BASE, 0x100)
-            if bda is None:
-                raise SessionError("could not read the BIOS data area")
-            head = struct.unpack_from("<H", bda, KEYBOARD_HEAD)[0]
-            tail = struct.unpack_from("<H", bda, KEYBOARD_TAIL)[0]
-            if not all(
-                KEYBOARD_START <= value < KEYBOARD_END and value % 2 == 0
-                for value in (head, tail)
-            ):
-                raise SessionError(
-                    f"the BIOS keyboard ring looks wrong (head={head:#x} tail={tail:#x}); "
-                    "the guest RAM base is probably misidentified"
-                )
-            following = tail + 2
-            if following >= KEYBOARD_END:
-                following = KEYBOARD_START
-            if following == head:
-                raise SessionError(
-                    "the BIOS keyboard ring is full; the game is not consuming keys "
-                    "(is it waiting on the mouse instead?)"
-                )
-            process.write(
-                self.ram_base + BDA_BASE + tail, struct.pack("<BB", ascii_code, scan_code)
-            )
-            process.write(
-                self.ram_base + BDA_BASE + KEYBOARD_TAIL, struct.pack("<H", following)
-            )
+            try:
+                target.push_key(ascii_code, scan_code)
+            except dosguest.GuestError as failure:
+                raise SessionError(str(failure)) from None
             report.append(f"{key} (ascii {ascii_code:#04x}, scan {scan_code:#04x})")
             if index + 1 < len(keys):
                 time.sleep(pace)
@@ -358,6 +369,70 @@ class Session:
         finally:
             process.write(self.ds_base + buttons_at, b"\x00\x00")
         return {"writes": writes, "stopped_on": stopped, "observed": observed}
+
+
+    # ── sampling ───────────────────────────────────────────────────────────
+
+    def sample(
+        self,
+        watch: list[tuple[str, int, int]],
+        seconds: float,
+        hz: float,
+        pokes: list[tuple[int, int, int]] | None = None,
+        settle: float = 0.0,
+    ) -> list[dict[str, int]]:
+        """Read a watch list repeatedly and return one row per instant.
+
+        ``dosbox_read_memory`` answers what a value *is* and ``dosbox_wait_for``
+        answers when it *becomes* something.  Neither answers how it moves,
+        which is what most questions about a running program actually are.
+
+        Each row is read from one whole-segment snapshot, so every field in a
+        row is from the same instant -- fields read one at a time would drift
+        against each other by exactly the amount that makes a trace unreadable.
+        """
+        self._require_named_segment("sampling")
+        self.locate()
+        process = self.process()
+        rows: list[dict[str, int]] = []
+
+        def take(elapsed: float) -> None:
+            raw = process.read(self.ds_base, SEGMENT_SIZE)
+            if raw is None:
+                raise SessionError("the data segment vanished mid-sample")
+            row = {"t_ms": int(elapsed * 1000)}
+            for name, offset, size in watch:
+                row[name] = int.from_bytes(raw[offset : offset + size], "little")
+            rows.append(row)
+
+        take(0.0)  # the entry instant, before anything is disturbed
+        if settle:
+            time.sleep(settle)
+        for offset, value, size in pokes or ():
+            process.write(self.ds_base + offset, int(value).to_bytes(size, "little"))
+
+        interval = 1.0 / hz if hz > 0 else 0.05
+        started = time.monotonic()
+        while time.monotonic() - started < seconds:
+            take(time.monotonic() - started)
+            remaining = interval - ((time.monotonic() - started) % interval)
+            time.sleep(min(remaining, interval))
+        return rows
+
+    def resolve_watch(self, names: list[str]) -> list[tuple[str, int, int]]:
+        """Turn watch names -- symbols, watch-set names, or offsets -- into fields."""
+        out: list[tuple[str, int, int]] = []
+        for entry in names:
+            expanded = self.profile.watch_sets.get(entry)
+            if expanded is not None:
+                out.extend(self.resolve_watch(list(expanded)))
+                continue
+            offset, size = self.profile.resolve(entry)
+            label = entry if isinstance(entry, str) else f"{offset:#06x}"
+            out.append((label, offset, max(1, size)))
+        if not out:
+            raise SessionError("give at least one symbol, watch set or offset to watch")
+        return out
 
     def _mouse_offsets(self) -> tuple[int, int]:
         if self.profile.mouse_buttons is None or self.profile.mouse_position is None:

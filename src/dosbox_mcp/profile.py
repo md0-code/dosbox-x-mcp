@@ -4,8 +4,13 @@ A profile is a small JSON file.  It carries the byte pattern that identifies
 the segment, the checks that prove a candidate really is that segment, the
 input offsets the game reads its mouse from, the screen geometry and palette,
 and any named offsets worth exposing to a caller by name instead of by number.
+It may also name watch sets for sampling, describe the guest's video mode, and
+record where the code segment has room for a trace cave.
 
-Nothing else in this server knows anything game-specific.
+Nothing else in this server knows anything game-specific.  A profile is also
+**optional**: :meth:`Profile.anonymous` stands in for one so a guest that
+nobody has profiled yet can still be found, searched and typed at, which is how
+the first profile for a new game gets written.
 """
 from __future__ import annotations
 
@@ -45,12 +50,50 @@ class Profile:
     screen_height: int
     palette: tuple[tuple[int, int, int], ...]
     symbols: dict[str, Symbol] = field(default_factory=dict)
+    watch_sets: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    video_mode: str = "13h"
+    code_segment_offset: int | None = None
+    caves: tuple[dict[str, Any], ...] = ()
+
+    # ── an absent profile ──────────────────────────────────────────────────
+
+    @classmethod
+    def anonymous(cls) -> "Profile":
+        """A profile for a game nobody has described yet.
+
+        It has no marker, so nothing identifies a data segment and every
+        DS-relative call refuses with an explanation.  Everything that works
+        off guest physical memory -- finding the guest, reading any segment,
+        searching, typing, the framebuffer -- works exactly as usual.
+        """
+        return cls(
+            name="(none)",
+            path=Path("(none)"),
+            description=(
+                "No profile.  The guest is addressed by segment; there is no "
+                "named data segment and no symbols."
+            ),
+            marker=b"",
+            marker_offset=0,
+            checks=(),
+            window_title="DOSBox-X",
+            ds_segment=None,
+            mouse_buttons=None,
+            mouse_position=None,
+            screen_width=320,
+            screen_height=200,
+            palette=(),
+        )
+
+    @property
+    def anonymous_profile(self) -> bool:
+        return not self.marker
 
     # ── segment identification ─────────────────────────────────────────────
 
     def validates(self, segment: bytes) -> bool:
         """Does this 64 KiB candidate satisfy every check in the profile?"""
-        if len(segment) != SEGMENT_SIZE:
+        if len(segment) != SEGMENT_SIZE or not self.marker:
             return False
         if segment[self.marker_offset : self.marker_offset + len(self.marker)] != self.marker:
             return False
@@ -136,7 +179,15 @@ def load_profile(path: str | Path) -> Profile:
     data = json.loads(path.read_text(encoding="utf-8"))
     base = path.parent
 
-    marker_spec = data["marker"]
+    marker_spec = data.get("marker")
+    if marker_spec is None:
+        raise ProfileError(
+            f"profile {path.name} has no marker, so nothing identifies the game's "
+            f"data segment.  Give marker.bytes (hex) with marker.offset, or "
+            f"marker.source_dump with marker.offset and marker.length.  To drive a "
+            f"game with no profile at all, pass no profile instead of writing an "
+            f"empty one."
+        )
     offset = _num(marker_spec["offset"])
     if "bytes" in marker_spec:
         marker = bytes.fromhex(marker_spec["bytes"])
@@ -167,6 +218,11 @@ def load_profile(path: str | Path) -> Profile:
 
     screen = data.get("screen", {})
     mouse = data.get("mouse", {})
+    video = data.get("video", {})
+    watch_sets = {
+        name: tuple(str(entry) for entry in entries)
+        for name, entries in data.get("watch_sets", {}).items()
+    }
     return Profile(
         name=data.get("name", path.stem),
         path=path,
@@ -186,6 +242,12 @@ def load_profile(path: str | Path) -> Profile:
         screen_height=int(screen.get("height", 200)),
         palette=_load_palette(screen.get("palette"), base),
         symbols=symbols,
+        watch_sets=watch_sets,
+        video_mode=str(video.get("mode", "13h")),
+        code_segment_offset=_optional_offset(video.get("code_segment_offset"))
+        if "code_segment_offset" in video
+        else _optional_offset(data.get("code_segment_offset")),
+        caves=tuple(data.get("caves", ())),
     )
 
 

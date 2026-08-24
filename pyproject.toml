@@ -17,7 +17,10 @@ classifiers = [
     "Topic :: System :: Emulators",
 ]
 dependencies = [
-    "mcp>=1.9",
+    # Capped below 2.0: that release removed `mcp.server.fastmcp`, which is the
+    # server this is built on.  Lifting the cap means porting to the new API,
+    # not just relaxing a number.
+    "mcp>=1.9,<2",
     "pydantic>=2",
 ]
 

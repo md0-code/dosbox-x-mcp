@@ -17,10 +17,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from dosbox_mcp import emulator, guest as dosguest, trace as tracing, vga  # noqa: E402
-from dosbox_mcp.platform import capabilities  # noqa: E402
+from dosbox_mcp import emulator, guest as dosguest, session as session_module, trace as tracing, vga  # noqa: E402
+from dosbox_mcp.platform import Window, capabilities  # noqa: E402
 from dosbox_mcp.profile import SEGMENT_SIZE, Profile, ProfileError, load_profile  # noqa: E402
-from dosbox_mcp.session import Condition, SessionError, key_codes  # noqa: E402
+from dosbox_mcp.raw_keyboard import resolve_raw_key  # noqa: E402
+from dosbox_mcp.session import Condition, Session, SessionError, key_codes  # noqa: E402
 
 from fake import FakeProcess, build_guest, draw, put_page  # noqa: E402
 
@@ -106,6 +107,101 @@ def test_key_codes_cover_names_and_characters():
     assert key_codes("F1") == (0x00, 0x3B)
     with pytest.raises(SessionError):
         key_codes("hyperspace")
+
+
+def test_raw_key_ids_match_the_versioned_dosbox_x_protocol():
+    assert resolve_raw_key("right").identifier == 86
+    assert resolve_raw_key("ctrl").identifier == 56
+    assert resolve_raw_key("escape").identifier == 49
+    assert resolve_raw_key("/").name == "slash"
+    with pytest.raises(ValueError):
+        resolve_raw_key("hyperspace")
+
+
+def test_raw_key_hold_uses_simultaneous_make_and_reverse_break(monkeypatch):
+    events = []
+    live = Session(pid=4242, profile=Profile.anonymous())
+    monkeypatch.setattr(
+        session_module, "find_windows", lambda **_: [Window(100, "DOSBox-X", 4242)]
+    )
+    monkeypatch.setattr(session_module, "raw_keyboard_available", lambda _: True)
+    monkeypatch.setattr(
+        session_module,
+        "raw_keyboard_event",
+        lambda handle, identifier, pressed: events.append((identifier, pressed)),
+    )
+    monkeypatch.setattr(session_module.time, "sleep", lambda _: None)
+
+    result = live.hold_keys(["ctrl", "right", "right"], 0.25)
+    assert events == [(56, True), (86, True), (86, False), (56, False)]
+    assert result["keys"] == ["leftctrl", "right"]
+    assert result["released"] is True
+    assert not live._pressed_keys
+
+
+def test_raw_key_hold_releases_after_an_interruption(monkeypatch):
+    events = []
+    live = Session(pid=4242, profile=Profile.anonymous())
+    monkeypatch.setattr(
+        session_module, "find_windows", lambda **_: [Window(100, "DOSBox-X", 4242)]
+    )
+    monkeypatch.setattr(session_module, "raw_keyboard_available", lambda _: True)
+    monkeypatch.setattr(
+        session_module,
+        "raw_keyboard_event",
+        lambda handle, identifier, pressed: events.append((identifier, pressed)),
+    )
+
+    def interrupt(_: float) -> None:
+        raise RuntimeError("interrupted")
+
+    monkeypatch.setattr(session_module.time, "sleep", interrupt)
+    with pytest.raises(RuntimeError, match="interrupted"):
+        live.hold_keys(["left", "space"], 1.0)
+    assert events == [(83, True), (53, True), (53, False), (83, False)]
+    assert not live._pressed_keys
+
+
+def test_key_state_lease_and_close_both_release(monkeypatch):
+    events = []
+    timers = []
+
+    class Timer:
+        def __init__(self, seconds, callback):
+            self.seconds = seconds
+            self.callback = callback
+            self.daemon = False
+            self.cancelled = False
+            timers.append(self)
+
+        def start(self):
+            pass
+
+        def cancel(self):
+            self.cancelled = True
+
+    live = Session(pid=4242, profile=Profile.anonymous())
+    monkeypatch.setattr(
+        session_module, "find_windows", lambda **_: [Window(100, "DOSBox-X", 4242)]
+    )
+    monkeypatch.setattr(session_module, "raw_keyboard_available", lambda _: True)
+    monkeypatch.setattr(
+        session_module,
+        "raw_keyboard_event",
+        lambda handle, identifier, pressed: events.append((identifier, pressed)),
+    )
+    monkeypatch.setattr(session_module.threading, "Timer", Timer)
+
+    down = live.key_state("right", True, 3.0)
+    assert down["lease_seconds"] == 3.0
+    assert events == [(86, True)]
+    timers[0].callback()
+    assert events[-1] == (86, False)
+
+    live.key_state("space", True, 3.0)
+    live.close()
+    assert timers[1].cancelled
+    assert events[-1] == (53, False)
 
 
 # ── finding a guest ────────────────────────────────────────────────────────

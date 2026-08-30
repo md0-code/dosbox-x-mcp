@@ -17,12 +17,21 @@ and the DS-relative calls say so rather than guessing.
 from __future__ import annotations
 
 import struct
+import threading
 import time
 from dataclasses import dataclass, field
 
 from . import guest as dosguest
-from .platform import Process, ProcessError, Window, find_windows
+from .platform import (
+    Process,
+    ProcessError,
+    Window,
+    find_windows,
+    raw_keyboard_available,
+    raw_keyboard_event,
+)
 from .profile import SEGMENT_SIZE, Profile, ProfileError
+from .raw_keyboard import RawKey, resolve_raw_key
 from .vga import Framebuffer
 
 BDA_BASE = 0x0400
@@ -144,6 +153,10 @@ class Session:
     traces: dict = field(default_factory=dict)
     _process: Process | None = None
     _framebuffer: Framebuffer | None = None
+    _pressed_keys: dict[str, int] = field(default_factory=dict, repr=False)
+    _bounded_keys: set[str] = field(default_factory=set, repr=False)
+    _key_timers: dict[str, threading.Timer] = field(default_factory=dict, repr=False)
+    _key_lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
     # ── plumbing ───────────────────────────────────────────────────────────
 
@@ -154,6 +167,7 @@ class Session:
         return self._process
 
     def close(self) -> None:
+        self.release_all_keys()
         if self._process is not None:
             self._process.close()
             self._process = None
@@ -315,6 +329,166 @@ class Session:
             if index + 1 < len(keys):
                 time.sleep(pace)
         return report
+
+    def _raw_window(self) -> Window:
+        windows = find_windows(pid=self.pid)
+        for window in windows:
+            if raw_keyboard_available(window.handle):
+                return window
+        if windows:
+            raise SessionError(
+                "this DOSBox-X build does not expose the MCP keyboard v1 hook; "
+                "apply companion/dosbox-x-mcp-keyboard-v1.patch to DOSBox-X "
+                "2026.07.02 and use that executable"
+            )
+        raise SessionError(f"process {self.pid} has no visible DOSBox-X window")
+
+    @staticmethod
+    def _resolve_raw_key(key: str) -> RawKey:
+        try:
+            return resolve_raw_key(key)
+        except ValueError as failure:
+            raise SessionError(str(failure)) from None
+
+    def raw_keyboard_supported(self) -> bool:
+        return any(
+            raw_keyboard_available(window.handle) for window in find_windows(pid=self.pid)
+        )
+
+    def _cancel_key_timer(self, name: str) -> None:
+        timer = self._key_timers.pop(name, None)
+        if timer is not None:
+            timer.cancel()
+
+    def key_state(self, key: str, pressed: bool, lease_seconds: float = 5.0) -> dict[str, object]:
+        """Set one authentic emulator key state, with an automatic release lease."""
+        resolved = self._resolve_raw_key(key)
+        window = self._raw_window()
+        with self._key_lock:
+            if resolved.name in self._bounded_keys:
+                raise SessionError(
+                    f"key {resolved.name} is owned by a bounded hold; wait for it to finish"
+                )
+            self._cancel_key_timer(resolved.name)
+            was_pressed = resolved.name in self._pressed_keys
+            if pressed:
+                if not was_pressed:
+                    raw_keyboard_event(window.handle, resolved.identifier, True)
+                    self._pressed_keys[resolved.name] = resolved.identifier
+
+                timer: threading.Timer
+
+                def expire() -> None:
+                    with self._key_lock:
+                        if self._key_timers.get(resolved.name) is not timer:
+                            return
+                        self._key_timers.pop(resolved.name, None)
+                        if resolved.name not in self._pressed_keys:
+                            return
+                        try:
+                            raw_keyboard_event(window.handle, resolved.identifier, False)
+                        except ProcessError:
+                            pass
+                        finally:
+                            self._pressed_keys.pop(resolved.name, None)
+
+                timer = threading.Timer(lease_seconds, expire)
+                timer.daemon = True
+                self._key_timers[resolved.name] = timer
+                timer.start()
+            else:
+                # Send a break even when this session did not record the make;
+                # this is a deliberate recovery path for an interrupted client.
+                raw_keyboard_event(window.handle, resolved.identifier, False)
+                self._pressed_keys.pop(resolved.name, None)
+            return {
+                "key": resolved.name,
+                "identifier": resolved.identifier,
+                "pressed": pressed,
+                "changed": was_pressed != pressed,
+                "lease_seconds": lease_seconds if pressed else None,
+            }
+
+    def hold_keys(self, keys: list[str], seconds: float) -> dict[str, object]:
+        """Hold simultaneous emulator keys and release every make in reverse order."""
+        resolved: list[RawKey] = []
+        seen: set[str] = set()
+        for key in keys:
+            item = self._resolve_raw_key(key)
+            if item.name not in seen:
+                seen.add(item.name)
+                resolved.append(item)
+        if not resolved:
+            raise SessionError("hold_keys requires at least one key")
+        window = self._raw_window()
+        pressed_now: list[RawKey] = []
+        failures: list[str] = []
+        with self._key_lock:
+            overlap = [item.name for item in resolved if item.name in self._pressed_keys]
+            if overlap:
+                raise SessionError(
+                    "cannot start a bounded hold while these keys already have active "
+                    "leases: " + ", ".join(overlap)
+                )
+            try:
+                for item in resolved:
+                    raw_keyboard_event(window.handle, item.identifier, True)
+                    self._pressed_keys[item.name] = item.identifier
+                    self._bounded_keys.add(item.name)
+                    pressed_now.append(item)
+            except Exception:
+                for item in reversed(pressed_now):
+                    try:
+                        raw_keyboard_event(window.handle, item.identifier, False)
+                    except Exception:
+                        pass
+                    finally:
+                        self._pressed_keys.pop(item.name, None)
+                        self._bounded_keys.discard(item.name)
+                raise
+        try:
+            time.sleep(seconds)
+        finally:
+            with self._key_lock:
+                for item in reversed(pressed_now):
+                    try:
+                        raw_keyboard_event(window.handle, item.identifier, False)
+                    except Exception as failure:
+                        failures.append(f"{item.name}: {failure}")
+                    finally:
+                        self._pressed_keys.pop(item.name, None)
+                        self._bounded_keys.discard(item.name)
+        if failures:
+            raise SessionError("key release failed: " + "; ".join(failures))
+        return {
+            "keys": [item.name for item in resolved],
+            "identifiers": [item.identifier for item in resolved],
+            "duration_seconds": seconds,
+            "released": True,
+        }
+
+    def release_all_keys(self) -> None:
+        """Best-effort break for every key owned by this session."""
+        with self._key_lock:
+            for timer in self._key_timers.values():
+                timer.cancel()
+            self._key_timers.clear()
+            pressed = list(self._pressed_keys.items())
+            self._pressed_keys.clear()
+            self._bounded_keys.clear()
+            if not pressed:
+                return
+            windows = find_windows(pid=self.pid)
+            window = next(
+                (item for item in windows if raw_keyboard_available(item.handle)), None
+            )
+            if window is None:
+                return
+            for _, identifier in reversed(pressed):
+                try:
+                    raw_keyboard_event(window.handle, identifier, False)
+                except ProcessError:
+                    pass
 
     def click(self, x: int, y: int, duration: float, button: int = 1) -> int:
         """Hold one controlled click in the game's post-INT-33 input state.

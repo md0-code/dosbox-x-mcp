@@ -287,6 +287,8 @@ def grab_client(handle: int) -> tuple[int, int, bytes]:
 
 WM_COMMAND = 0x0111
 MF_BYPOSITION = 0x0400
+MCP_KEYBOARD_MESSAGE = "DOSBox-X MCP keyboard v1"
+MCP_KEYBOARD_PROPERTY = "DOSBoxXMCPKeyboardV1"
 
 #: Fallbacks for a build whose menu cannot be walked (a hidden menu bar, say).
 #: These are stable within a build; the walk below is what survives an upgrade.
@@ -321,6 +323,10 @@ user32.GetMenuStringW.argtypes = [wt.HMENU, wt.UINT, wt.LPWSTR, ctypes.c_int, wt
 user32.GetMenuStringW.restype = ctypes.c_int
 user32.PostMessageW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
 user32.PostMessageW.restype = wt.BOOL
+user32.RegisterWindowMessageW.argtypes = [wt.LPCWSTR]
+user32.RegisterWindowMessageW.restype = wt.UINT
+user32.GetPropW.argtypes = [wt.HWND, wt.LPCWSTR]
+user32.GetPropW.restype = wt.HANDLE
 
 
 def menu_window(pid: int) -> int | None:
@@ -394,6 +400,26 @@ def menu_command(handle: int, identifier: int) -> None:
         )
 
 
+def raw_keyboard_available(handle: int) -> bool:
+    """Whether this window exposes the versioned DOSBox-X keyboard hook."""
+    return int(user32.GetPropW(handle, MCP_KEYBOARD_PROPERTY) or 0) == 1
+
+
+def raw_keyboard_event(handle: int, identifier: int, pressed: bool) -> None:
+    """Queue one authentic KEYBOARD_AddKey transition without activating a window."""
+    if not raw_keyboard_available(handle):
+        raise ProcessError(
+            "this DOSBox-X window does not expose the MCP keyboard v1 hook; "
+            "build DOSBox-X 2026.07.02 with companion/dosbox-x-mcp-keyboard-v1.patch"
+        )
+    message = user32.RegisterWindowMessageW(MCP_KEYBOARD_MESSAGE)
+    if not message or not user32.PostMessageW(handle, message, identifier, int(pressed)):
+        raise ProcessError(
+            f"the emulator refused raw keyboard event {identifier} "
+            f"(error {ctypes.get_last_error()})"
+        )
+
+
 def capabilities() -> Capabilities:
     return Capabilities(
         platform="windows",
@@ -402,6 +428,7 @@ def capabilities() -> Capabilities:
         window_capture=True,
         window_resize=True,
         menu_commands=True,
+        raw_keyboard=True,
         isolated_display=False,
         notes=(
             "The emulator must run at the same integrity level as this server; "

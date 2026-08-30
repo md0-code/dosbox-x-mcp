@@ -59,6 +59,8 @@ menu_window = _from_backend("menu_window", lambda pid: None)
 menu_items = _from_backend("menu_items", lambda handle, depth=4: {})
 resolve_command = _from_backend("resolve_command")
 menu_command = _from_backend("menu_command")
+raw_keyboard_available = _from_backend("raw_keyboard_available", lambda handle: False)
+raw_keyboard_event = _from_backend("raw_keyboard_event")
 terminate = _from_backend("terminate")
 
 
@@ -97,6 +99,8 @@ __all__ = [
     "menu_items",
     "menu_window",
     "name",
+    "raw_keyboard_available",
+    "raw_keyboard_event",
     "require",
     "resize_client",
     "resolve_command",

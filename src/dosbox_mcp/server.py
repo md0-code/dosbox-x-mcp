@@ -2,9 +2,8 @@
 
 Every tool here works through the emulator process itself -- its memory and its
 window -- so nothing steals focus, moves the pointer, or types into whatever the
-user happens to be doing.  Keys go into the guest's BIOS keyboard ring, clicks
-go into the game's own post-INT-33 mouse words, and frames are photographed with
-PrintWindow rather than off the screen.
+user happens to be doing.  Menu keys go into the BIOS ring; authentic held keys
+use a versioned DOSBox-X hook; clicks enter the game's post-INT-33 mouse words.
 
 Configuration comes from the environment:
 
@@ -59,6 +58,8 @@ mcp = FastMCP(
         "marker a profile needs.  dosbox_compare_frames, dosbox_act_and_observe, "
         "dosbox_scan_changes and dosbox_correlate_memory add structured visual/"
         "memory experiments without assigning game semantics to the evidence.  "
+        "dosbox_key_state and dosbox_hold_keys provide real make/break input "
+        "when DOSBox-X has the companion keyboard hook.  "
         "dosbox_capabilities says what this host can do before anything is tried."
     ),
 )
@@ -246,11 +247,14 @@ class MemoryRangeProbe(BaseModel):
 
 
 class ExperimentAction(BaseModel):
-    """An action supported by existing, technically valid input primitives."""
+    """One technically valid bounded input or control action."""
 
-    kind: Literal["idle", "keys", "click", "hold_buttons"] = Field(
+    kind: Literal["idle", "keys", "hold_keys", "click", "hold_buttons"] = Field(
         default="idle",
-        description="Idle control, BIOS key events, one click, or held game mouse buttons.",
+        description=(
+            "Idle control, BIOS key events, authentic simultaneous held keys, "
+            "one click, or held game mouse buttons."
+        ),
     )
     keys: list[str] = Field(
         default_factory=list,
@@ -395,6 +399,7 @@ async def dosbox_launch(
         "display": display.name if display is not None else None,
         "config": str(config_path),
         "captures_directory": str(emulator.captures_directory(config_path)),
+        "raw_keyboard": session.raw_keyboard_supported(),
     }
 
 
@@ -423,6 +428,7 @@ async def dosbox_attach(
             f"0x{session.ram_base:X}" if session.ram_base is not None else None
         ),
         "keyboard_injection": session.ram_base is not None,
+        "raw_keyboard": session.raw_keyboard_supported(),
         "window_title": window.title if window else None,
     }
 
@@ -455,6 +461,7 @@ def dosbox_sessions(window_title: str | None = None) -> dict[str, Any]:
                     f"0x{session.ds_base:X}" if session.ds_base else None
                 ),
                 "segment_scans": session.scans,
+                "raw_keyboard": session.raw_keyboard_supported(),
             }
         )
     return {"attached": sessions, "windows": windows}
@@ -517,6 +524,48 @@ async def dosbox_send_keys(
     session = _session(pid)
     sent = await asyncio.to_thread(session.press, keys, pace_seconds)
     return {"pid": session.pid, "sent": sent, "count": len(sent)}
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True),
+    description=(
+        "Set one authentic DOSBox-X keyboard make/break state without activating "
+        "its window.  This requires the versioned companion keyboard hook.  A "
+        "pressed key is automatically released when its lease expires, when the "
+        "session closes, or when pressed=false is sent, so interrupted clients do "
+        "not leave keys stuck."
+    ),
+)
+async def dosbox_key_state(
+    key: Annotated[str, Field(description="Physical key name, such as right, space, or leftctrl.")],
+    pressed: bool,
+    pid: int | None = None,
+    lease_seconds: Annotated[
+        float, Field(gt=0, le=30, description="Automatic release deadline for pressed=true.")
+    ] = 5.0,
+) -> dict[str, Any]:
+    session = _session(pid)
+    result = await asyncio.to_thread(session.key_state, key, pressed, lease_seconds)
+    return {"pid": session.pid, "transport": "dosbox_x_keyboard_hook_v1", **result}
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True),
+    description=(
+        "Hold one or more physical keys simultaneously through DOSBox-X's own "
+        "KEYBOARD_AddKey path, then release every key in reverse order even if "
+        "the hold is interrupted.  This supplies authentic make/break input to "
+        "IRQ1/action games without focus or host keystrokes."
+    ),
+)
+async def dosbox_hold_keys(
+    keys: Annotated[list[str], Field(min_length=1, max_length=16)],
+    duration_seconds: Annotated[float, Field(gt=0, le=30)],
+    pid: int | None = None,
+) -> dict[str, Any]:
+    session = _session(pid)
+    result = await asyncio.to_thread(session.hold_keys, keys, duration_seconds)
+    return {"pid": session.pid, "transport": "dosbox_x_keyboard_hook_v1", **result}
 
 
 @mcp.tool(
@@ -1486,6 +1535,20 @@ def _perform_action(session: Session, action: ExperimentAction, observation_seco
                 "consumed by action games that read IRQ1, port 0x60, or a key-state table."
             ),
         }
+    if action.kind == "hold_keys":
+        if not action.keys:
+            raise SessionError("kind=hold_keys requires at least one key")
+        if action.duration_seconds > observation_seconds:
+            raise SessionError(
+                f"action duration {action.duration_seconds:.3f}s is longer than the "
+                f"{observation_seconds:.3f}s observation"
+            )
+        result = session.hold_keys(action.keys, action.duration_seconds)
+        return {
+            "kind": "hold_keys",
+            "transport": "dosbox_x_keyboard_hook_v1",
+            **result,
+        }
     if action.duration_seconds > observation_seconds:
         raise SessionError(
             f"action duration {action.duration_seconds:.3f}s is longer than the "
@@ -1534,8 +1597,9 @@ def _perform_action(session: Session, action: ExperimentAction, observation_seco
         "indexed frame and requested memory, apply one existing valid input "
         "action, observe distinct frames and memory samples, then return exact "
         "visual differences, neutral region tracks, before/after fields, and an "
-        "optional unknown-memory change scan.  Keys use the BIOS ring and the "
-        "result explicitly reports that this is NOT held/raw keyboard input.  "
+        "optional unknown-memory change scan.  kind=keys uses the BIOS ring; "
+        "kind=hold_keys uses authentic make/break input through the versioned "
+        "DOSBox-X companion hook.  "
         "Use action.kind=idle for a control experiment.  Give stem to retain "
         "raw indexed frames and before/after memory snapshots for later branch "
         "comparison with dosbox_compare_frames and dosbox_scan_changes."

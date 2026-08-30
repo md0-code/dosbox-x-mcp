@@ -52,6 +52,7 @@ class Capabilities:
     window_capture: bool = False
     window_resize: bool = False
     menu_commands: bool = False
+    raw_keyboard: bool = False
     isolated_display: bool = False
     notes: tuple[str, ...] = field(default_factory=tuple)
 
@@ -63,6 +64,7 @@ class Capabilities:
             "window_capture": self.window_capture,
             "window_resize": self.window_resize,
             "menu_commands": self.menu_commands,
+            "raw_keyboard": self.raw_keyboard,
             "isolated_display": self.isolated_display,
             "notes": list(self.notes),
         }

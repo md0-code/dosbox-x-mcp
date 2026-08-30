@@ -17,7 +17,7 @@ without changing a byte on disk.
 | --- | --- |
 | **Find a guest** | Locate a DOS guest from BIOS invariants alone — no profile, no marker, nothing known in advance. Walk the DOS memory chain and name every loaded program, its segment and the path it came from. |
 | **Address any segment** | Another program in a launcher chain, a TSR, an overlay, the interrupt vector table, EMS pages. Read, patch, dump, search. |
-| **Drive it** | Keys into the BIOS keyboard ring. Clicks into the game's own post-INT-33h mouse words. Neither goes near the host's input queue. |
+| **Drive it** | Menu keys through the BIOS ring; authentic simultaneous make/break holds through the companion DOSBox-X hook; clicks through the game's post-INT-33h mouse words. None goes near the host's input queue. |
 | **See it** | Read the framebuffer straight out of the emulator's video memory: exact indices, no window, no scaling, no cost to the guest — confirmed against a reference frame. Or photograph the window when you must. |
 | **Experiment** | Compare exact frames, extract and track neutral changed regions, apply one bounded action while observing visual and memory consequences, scan unknown memory, and correlate numeric evidence. |
 | **Measure it** | Block on a memory condition, or sample a watch list at up to 200 Hz into a TSV — every column from one snapshot, so they cannot drift apart. Watch video memory for every distinct frame and when it appeared. |
@@ -34,8 +34,10 @@ Nothing here involves the host's input queue or screen.
   finds guest physical zero, and from there every segment is addressable. This
   needs no profile, which is what breaks the chicken and egg a new project
   starts inside.
-* **Keys** are appended to the guest's BIOS keyboard ring exactly as a real
-  keyboard interrupt would.
+* **Menu keys** are appended to the guest's BIOS keyboard ring.
+* **Held keys** enter DOSBox-X's own `KEYBOARD_AddKey` path through a small,
+  versioned companion hook. This produces real make/break scan codes for IRQ1
+  games, supports simultaneous keys, and never activates the emulator window.
 * **Clicks** are written into the words the game's own INT 33h handler fills
   in — the state the game actually reads. They are rewritten continuously for a
   moment, because the game's handler keeps overwriting them and a single write
@@ -108,6 +110,8 @@ there is never any doubt where a file went.
 | `dosbox_find_guest` | find the guest and list every loaded program — **no profile needed** |
 | `dosbox_search_memory` | find a byte pattern, reported as guest `segment:offset` |
 | `dosbox_send_keys` | type into the BIOS keyboard ring |
+| `dosbox_key_state` | set authentic make/break state with automatic lease release |
+| `dosbox_hold_keys` | hold simultaneous authentic keys for a bounded duration |
 | `dosbox_click` | click through the game's own mouse words |
 | `dosbox_hold_buttons` | hold buttons down, optionally until a memory test passes |
 | `dosbox_read_memory` | read the data segment, or any segment |
@@ -225,7 +229,7 @@ dosbox_act_and_observe(
   stem="experiments/idle")
 
 dosbox_act_and_observe(
-  action={"kind":"keys","keys":["right"]}, duration_seconds=0.5,
+  action={"kind":"hold_keys","keys":["right"],"duration_seconds":0.35},
   memory_fields=[{"label":"candidate_x","offset":"0x19A4","size":2}],
   stem="experiments/right")
 ```
@@ -233,8 +237,8 @@ dosbox_act_and_observe(
 `kind="keys"` appends BIOS key events. It does **not** hold a physical key or
 manufacture make/break state by repeatedly filling the BIOS queue. Games that
 read IRQ1, port `0x60`, or their own held-key table may ignore it; the tool says
-so in every result. Authentic held/raw keyboard control needs a DOSBox-X-side
-input mechanism and is a separate milestone.
+so in every result. Use `kind="hold_keys"` with a
+[companion-enabled DOSBox-X build](docs/raw-keyboard.md) for those games.
 
 Compare independent branches or repeated trials with an idle control and an
 opposite action:

@@ -319,6 +319,9 @@ class _ExperimentSession:
     def press(self, keys, pace):
         return [f"{key} fixture" for key in keys]
 
+    def hold_keys(self, keys, seconds):
+        return {"keys": keys, "duration_seconds": seconds, "released": True}
+
 
 def test_act_and_observe_composes_action_frames_tracks_and_memory(monkeypatch):
     live = _ExperimentSession()
@@ -339,3 +342,21 @@ def test_act_and_observe_composes_action_frames_tracks_and_memory(monkeypatch):
     assert result["visual"]["baseline_to_final"]["changed_pixels"] == 4
     assert result["memory"]["fields"]["candidate"]["delta"] > 0
     assert result["epistemic_status"].startswith("observed visual/memory evidence")
+
+
+def test_act_and_observe_accepts_authentic_held_keys(monkeypatch):
+    live = _ExperimentSession()
+    monkeypatch.setattr(server, "_session", lambda pid: live)
+    result = asyncio.run(
+        server.dosbox_act_and_observe(
+            server.ExperimentAction(
+                kind="hold_keys", keys=["right", "space"], duration_seconds=0.02
+            ),
+            duration_seconds=0.04,
+            interval_seconds=0.01,
+            max_samples=10,
+            max_frames=10,
+        )
+    )
+    assert result["action"]["transport"] == "dosbox_x_keyboard_hook_v1"
+    assert result["action"]["released"] is True

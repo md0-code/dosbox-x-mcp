@@ -1,0 +1,69 @@
+diff --git a/src/gui/sdlmain.cpp b/src/gui/sdlmain.cpp
+index b6227ba..51d07d5 100644
+--- a/src/gui/sdlmain.cpp
++++ b/src/gui/sdlmain.cpp
+@@ -1022,6 +1022,34 @@ HWND GetHWND(void) {
+ #endif
+ }
+ 
++/* Optional no-focus keyboard control surface used by dosbox-x-mcp.
++ *
++ * RegisterWindowMessage keeps the protocol out of the fixed WM_APP range,
++ * while the window property lets clients distinguish a patched build from a
++ * stock DOSBox-X before sending anything.  Messages are consumed on the main
++ * SDL event thread and enter the same KEYBOARD_AddKey path as mapper input. */
++static const char *const DOSBOX_MCP_KEYBOARD_MESSAGE =
++    "DOSBox-X MCP keyboard v1";
++static const char *const DOSBOX_MCP_KEYBOARD_PROPERTY =
++    "DOSBoxXMCPKeyboardV1";
++
++static UINT DOSBoxMCPKeyboardMessage(void) {
++    static const UINT message = RegisterWindowMessageA(DOSBOX_MCP_KEYBOARD_MESSAGE);
++    return message;
++}
++
++static void DOSBoxMCPKeyboardInit(void) {
++    SetPropA(GetHWND(), DOSBOX_MCP_KEYBOARD_PROPERTY, reinterpret_cast<HANDLE>(1));
++    DOSBoxMCPKeyboardMessage();
++}
++
++static bool DOSBoxMCPKeyboardHandle(UINT message, WPARAM key, LPARAM pressed) {
++    if (message != DOSBoxMCPKeyboardMessage()) return false;
++    if (key > KBD_NONE && key < KBD_LAST && (pressed == 0 || pressed == 1))
++        KEYBOARD_AddKey(static_cast<KBD_KEYS>(key), pressed != 0);
++    return true;
++}
++
+ HWND GetSurfaceHWND(void) {
+ # if defined(C_SDL2)
+     return GetHWND();
+@@ -2039,6 +2067,7 @@ void SDL_Prepare(void) {
+ 
+ #if defined(WIN32) && !defined(HX_DOS) // Microsoft Windows specific
+     SDL_EventState(SDL_SYSWMEVENT, SDL_ENABLE);
++    DOSBoxMCPKeyboardInit();
+ #if !defined(C_SDL2)
+     LOG(LOG_MISC,LOG_DEBUG)("Win32: Preparing main window to accept files dragged in from the Windows shell");
+ 
+@@ -5955,6 +5984,10 @@ void GFX_Events() {
+         switch (event.type) {
+ #if defined(WIN32) && !defined(HX_DOS)
+         case SDL_SYSWMEVENT:
++            if (DOSBoxMCPKeyboardHandle(event.syswm.msg->msg.win.msg,
++                                        event.syswm.msg->msg.win.wParam,
++                                        event.syswm.msg->msg.win.lParam))
++                break;
+             switch( event.syswm.msg->msg.win.msg ) {
+                 case WM_COMMAND:
+                     MSG_WM_COMMAND_handle(/*&*/(*event.syswm.msg));
+@@ -6389,6 +6422,10 @@ void GFX_Events() {
+         switch (event.type) {
+ #ifdef __WIN32__
+         case SDL_SYSWMEVENT : {
++            if (DOSBoxMCPKeyboardHandle(event.syswm.msg->msg,
++                                        event.syswm.msg->wParam,
++                                        event.syswm.msg->lParam))
++                break;
+             switch( event.syswm.msg->msg ) {
+ #if !defined(HX_DOS)
+                 case WM_COMMAND:

@@ -229,6 +229,19 @@ def test_the_page_is_found_by_a_reference_and_read_back():
     assert buffer.read() == page
 
 
+def test_a_linear_indexed_page_is_found_by_a_reference_and_read_back():
+    page = draw(seed=9)
+    memory = bytearray(0x100000)
+    process = FakeProcess(memory)
+    offset = 0x43210
+    process.memory[offset : offset + len(page)] = page
+    buffer = vga.Framebuffer(process)
+    found = buffer.locate(page)
+    assert found.confirmed and found.storage == "linear"
+    assert found.page_offset == offset
+    assert buffer.read() == page
+
+
 def test_a_blind_scan_finds_a_picture_and_admits_it_is_unconfirmed():
     page = draw(seed=3)
     memory = bytearray(0x100000)

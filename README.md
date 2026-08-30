@@ -19,6 +19,7 @@ without changing a byte on disk.
 | **Address any segment** | Another program in a launcher chain, a TSR, an overlay, the interrupt vector table, EMS pages. Read, patch, dump, search. |
 | **Drive it** | Keys into the BIOS keyboard ring. Clicks into the game's own post-INT-33h mouse words. Neither goes near the host's input queue. |
 | **See it** | Read the framebuffer straight out of the emulator's video memory: exact indices, no window, no scaling, no cost to the guest — confirmed against a reference frame. Or photograph the window when you must. |
+| **Experiment** | Compare exact frames, extract and track neutral changed regions, apply one bounded action while observing visual and memory consequences, scan unknown memory, and correlate numeric evidence. |
 | **Measure it** | Block on a memory condition, or sample a watch list at up to 200 Hz into a TSV — every column from one snapshot, so they cannot drift apart. Watch video memory for every distinct frame and when it appeared. |
 | **Record it** | The emulator's own OPL, MIDI and WAVE capture, fired without focus and without the host mapper. |
 | **Instrument it** | Redirect a live `CALL` through a code cave that records registers and memory at every hit, then read it while the guest runs at full speed. Nothing on disk changes. |
@@ -118,6 +119,10 @@ there is never any doubt where a file went.
 | `dosbox_capture_screen` | save an exact frame, from video memory or the window |
 | `dosbox_read_framebuffer` | read the page out of video memory |
 | `dosbox_watch_frames` | every distinct frame in a stretch of time, with timings |
+| `dosbox_compare_frames` | exact differences, changed regions and neutral tracks across saved indexed frames |
+| `dosbox_act_and_observe` | one bounded action plus its visual and memory consequences |
+| `dosbox_scan_changes` | rank 1-, 2- or 4-byte fields across experiment/control snapshots |
+| `dosbox_correlate_memory` | correlate a visual numeric series with candidate memory series |
 | `dosbox_emulator_command` | fire one of DOSBox-X's own menu items |
 | `dosbox_record` | record OPL, MIDI or WAVE output to a file |
 | `dosbox_find_cave` | find zero-filled runs big enough for a trace |
@@ -182,6 +187,79 @@ guess for anyone who wants to check it themselves.
 The page is not necessarily where you would guess: it begins where the CRTC
 start address puts it, which is a four-byte boundary and nothing coarser. The
 one measured live sat at offset 16.
+
+## Perception and controlled experiments
+
+Perception tools report measurements, not game meanings. A region is an exact
+connected set of changed pixels; a track is a deterministic association between
+regions in successive transitions. Neither is silently called a player, enemy,
+wall or sprite. Memory offsets are likewise candidates until independently
+confirmed.
+
+Compare two saved indexed frames:
+
+```text
+dosbox_compare_frames(
+  frames=["trial_before.bin", "trial_after.bin"],
+  width=320, height=200, bridge_radius=1, min_changed_pixels=3)
+→ 428 changed pixels; region 1 bbox [115,92,23,27]
+```
+
+Pass a longer sequence to obtain stable track IDs and measured displacement:
+
+```text
+dosbox_compare_frames(
+  frames=["walk_000.bin", "walk_001.bin", "walk_002.bin"],
+  bridge_radius=2)
+→ track 3: dx +7, dy 0, age 2, confidence 0.91
+```
+
+Run an idle control or a bounded action and collect both evidence streams in one
+round trip:
+
+```text
+dosbox_act_and_observe(
+  action={"kind":"idle"}, duration_seconds=1.0,
+  memory_fields=[{"label":"clock","offset":"tick_counter","size":4}],
+  memory_range={"offset":"0x6000","length":1024,"value_size":2},
+  stem="experiments/idle")
+
+dosbox_act_and_observe(
+  action={"kind":"keys","keys":["right"]}, duration_seconds=0.5,
+  memory_fields=[{"label":"candidate_x","offset":"0x19A4","size":2}],
+  stem="experiments/right")
+```
+
+`kind="keys"` appends BIOS key events. It does **not** hold a physical key or
+manufacture make/break state by repeatedly filling the BIOS queue. Games that
+read IRQ1, port `0x60`, or their own held-key table may ignore it; the tool says
+so in every result. Authentic held/raw keyboard control needs a DOSBox-X-side
+input mechanism and is a separate milestone.
+
+Compare independent branches or repeated trials with an idle control and an
+opposite action:
+
+```text
+dosbox_scan_changes(
+  baseline="baseline.bin", experiment="right.bin",
+  control="idle.bin", opposite="left.bin",
+  value_size=2, relation="increased", aligned=true)
+→ DS:19A4 increased during RIGHT, stayed stable while idle,
+  and changed in the opposite direction during LEFT
+```
+
+Finally, rank sampled candidate fields against a measured track coordinate:
+
+```text
+dosbox_correlate_memory(
+  visual_series=[115,120,126,132],
+  memory_series={"DS:19A4":[1840,1920,2016,2112]})
+→ raw/difference correlation, direction, and simple fixed-scale evidence
+```
+
+Frame processing is dependency-free and practical for 320×200 indexed modes.
+Large whole-screen transitions reset associations instead of creating hundreds
+of long-lived tracks; crossings and temporary disappearances reduce confidence.
 
 ## Profiles
 
@@ -268,8 +346,8 @@ binary. There is no backend for it.
 * Trace memory captures are read through whatever `DS` holds when the cave
   runs. For a game with one data segment that is exactly right; for a routine
   that switches `DS`, capture `ds` alongside and check it.
-* Only chain-4 linear mode 13h is read out of video memory. Anything else needs
-  `source="window"`.
+* Indexed mode 13h pages stored in DOSBox-X's chain-4 or linear backing layout
+  are read out of video memory. Anything else needs `source="window"`.
 * A blind framebuffer scan is a hint, not an answer, and is reported as
   unconfirmed. Give a reference frame.
 

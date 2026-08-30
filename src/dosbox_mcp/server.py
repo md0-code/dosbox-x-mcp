@@ -16,6 +16,7 @@ Configuration comes from the environment:
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import os
 import subprocess
 import sys
@@ -28,7 +29,7 @@ from pydantic import BaseModel, Field
 from mcp.server.fastmcp import FastMCP, Image
 from mcp.types import ToolAnnotations
 
-from . import emulator, guest as dosguest, platform as host, trace as tracing, vga
+from . import emulator, guest as dosguest, perception, platform as host, trace as tracing, vga
 from .profile import Profile, ProfileError, load_profile
 from .screen import CaptureError, capture_window, downscale_png, write_outputs
 from .session import Condition, Registry, Session, SessionError
@@ -55,8 +56,10 @@ mcp = FastMCP(
         "described yet -- attach anyway and call dosbox_find_guest, which "
         "reports the DOS memory chain and every loaded program; dosbox_search_"
         "memory then turns a known string into a segment, and that is the "
-        "marker a profile needs.  dosbox_capabilities says what this host can "
-        "do before anything is tried."
+        "marker a profile needs.  dosbox_compare_frames, dosbox_act_and_observe, "
+        "dosbox_scan_changes and dosbox_correlate_memory add structured visual/"
+        "memory experiments without assigning game semantics to the evidence.  "
+        "dosbox_capabilities says what this host can do before anything is tried."
     ),
 )
 
@@ -149,6 +152,17 @@ def _output(path: str) -> Path:
     return target
 
 
+def _input(path: str) -> Path:
+    """Resolve an existing input by the same rule used for tool outputs."""
+    target = Path(path)
+    if not target.is_absolute():
+        target = DEFAULT_OUTPUT_DIR / target
+    target = target.resolve()
+    if not target.is_file():
+        raise SessionError(f"no input file at {target}")
+    return target
+
+
 def _segment_number(value: int | str | None) -> int | None:
     """A guest segment, as a number or a 0x-string.  None means the profile's."""
     if value is None:
@@ -183,6 +197,80 @@ class MemoryWrite(BaseModel):
         default=None, description="Raw bytes as hex, used instead of `value`."
     )
     size: int = Field(default=1, ge=1, le=4, description="Width in bytes when using `value`.")
+
+
+class MemoryProbe(BaseModel):
+    """One numeric field sampled during an action experiment."""
+
+    label: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=80,
+        description="Neutral result label; defaults to the supplied offset/address.",
+    )
+    offset: int | str = Field(
+        description="Offset, or a profile symbol when segment is omitted."
+    )
+    size: int = Field(default=1, ge=1, le=4, description="Little-endian field width.")
+    segment: int | str | None = Field(
+        default=None,
+        description="Guest segment; omit for the profile's named data segment.",
+    )
+
+
+class MemoryRangeProbe(BaseModel):
+    """One bounded range snapshotted before and after an experiment."""
+
+    offset: int | str = Field(description="First byte offset in the segment.")
+    length: int = Field(ge=1, le=65536, description="Number of bytes to compare.")
+    segment: int | str | None = Field(
+        default=None,
+        description="Guest segment; omit for the profile's named data segment.",
+    )
+    value_size: Literal[1, 2, 4] = Field(
+        default=1, description="Candidate field width for the returned change scan."
+    )
+    aligned: bool = Field(
+        default=True,
+        description="Only test offsets aligned to value_size, avoiding overlapping duplicates.",
+    )
+    relation: Literal["changed", "unchanged", "increased", "decreased", "delta"] = Field(
+        default="changed", description="Numeric comparison applied to candidate fields."
+    )
+    expected_delta: int | None = Field(
+        default=None, description="Required when relation=delta."
+    )
+    candidate_limit: int = Field(
+        default=100, ge=1, le=2000, description="Maximum ranked candidates returned."
+    )
+
+
+class ExperimentAction(BaseModel):
+    """An action supported by existing, technically valid input primitives."""
+
+    kind: Literal["idle", "keys", "click", "hold_buttons"] = Field(
+        default="idle",
+        description="Idle control, BIOS key events, one click, or held game mouse buttons.",
+    )
+    keys: list[str] = Field(
+        default_factory=list,
+        max_length=15,
+        description="Key names/characters for kind=keys; these are BIOS queue events, not held keys.",
+    )
+    pace_seconds: float = Field(
+        default=0.0, ge=0, le=5, description="Delay between BIOS key events."
+    )
+    x: int | None = Field(default=None, ge=0, description="Guest X for kind=click.")
+    y: int | None = Field(default=None, ge=0, description="Guest Y for kind=click.")
+    buttons: int = Field(
+        default=1, ge=1, le=3, description="Mouse buttons: 1 left, 2 right, 3 both."
+    )
+    duration_seconds: float = Field(
+        default=0.25,
+        ge=0.01,
+        le=30,
+        description="Click/hold duration; must fit inside the observation interval.",
+    )
 
 
 # ── discovery and lifecycle ────────────────────────────────────────────────
@@ -1020,6 +1108,203 @@ def _locate_framebuffer(
     return buffer.locate(None)
 
 
+def _indexed_frame(path: str, width: int, height: int) -> tuple[Path, bytes]:
+    source = _input(path)
+    raw = source.read_bytes()
+    wanted = width * height
+    if len(raw) != wanted:
+        raise perception.PerceptionError(
+            f"indexed frame {source} must be exactly {wanted} bytes for "
+            f"{width}x{height}; it has {len(raw)}"
+        )
+    return source, raw
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+    description=(
+        "Compare two or more saved indexed framebuffers and return compact, "
+        "structured visual evidence: exact changed-pixel counts, connected "
+        "changed regions, and neutral region tracks across a sequence.  Frame "
+        "files contain one palette index per pixel, as written by "
+        "dosbox_read_framebuffer or dosbox_act_and_observe.  bridge_radius can "
+        "join the separated old/new footprints of a moving shape.  Track IDs "
+        "are visual associations only, never claims that a region is a player, "
+        "enemy, wall, or other game object."
+    ),
+)
+async def dosbox_compare_frames(
+    frames: Annotated[
+        list[str],
+        Field(min_length=2, max_length=100, description="Indexed .bin frames in time order."),
+    ],
+    width: Annotated[int, Field(ge=1, le=4096)] = 320,
+    height: Annotated[int, Field(ge=1, le=4096)] = 200,
+    bridge_radius: Annotated[
+        int, Field(ge=0, le=32, description="Difference-mask dilation radius in pixels.")
+    ] = 0,
+    min_changed_pixels: Annotated[
+        int, Field(ge=1, description="Discard connected regions with fewer exact changes.")
+    ] = 1,
+    connectivity: Literal[4, 8] = 8,
+    track_max_distance: Annotated[float, Field(gt=0, le=1024)] = 48.0,
+    track_max_missed: Annotated[int, Field(ge=0, le=20)] = 1,
+    global_change_fraction: Annotated[float, Field(gt=0, le=1)] = 0.35,
+) -> dict[str, Any]:
+    def compare() -> dict[str, Any]:
+        loaded = [_indexed_frame(path, width, height) for path in frames]
+        comparisons = [
+            perception.compare_frames(
+                before[1],
+                after[1],
+                width,
+                height,
+                bridge_radius=bridge_radius,
+                min_changed_pixels=min_changed_pixels,
+                connectivity=connectivity,
+            )
+            for before, after in zip(loaded, loaded[1:])
+        ]
+        transitions = []
+        for index, evidence in enumerate(comparisons):
+            transitions.append(
+                {
+                    "from": str(loaded[index][0]),
+                    "to": str(loaded[index + 1][0]),
+                    **evidence.as_dict(),
+                }
+            )
+        return {
+            "frame_count": len(loaded),
+            "transitions": transitions,
+            "tracking": perception.track_regions(
+                comparisons,
+                max_distance=track_max_distance,
+                max_missed=track_max_missed,
+                global_change_fraction=global_change_fraction,
+            ),
+            "epistemic_status": "observed visual evidence; no game semantics inferred",
+        }
+
+    return await asyncio.to_thread(compare)
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+    description=(
+        "Compare bounded binary memory snapshots and rank numeric offsets by "
+        "observed change.  Supports 1-, 2-, and 4-byte little-endian fields, "
+        "exact deltas, an idle/control snapshot, and an opposite-action "
+        "snapshot.  Use aligned=true to avoid floods of overlapping shifted "
+        "interpretations.  Results are candidate offsets with evidence, not "
+        "semantic declarations about what the fields mean."
+    ),
+)
+async def dosbox_scan_changes(
+    baseline: Annotated[str, Field(description="Baseline binary snapshot path.")],
+    experiment: Annotated[str, Field(description="Post-experiment binary snapshot path.")],
+    value_size: Literal[1, 2, 4] = 1,
+    relation: Literal["changed", "unchanged", "increased", "decreased", "delta"] = "changed",
+    expected_delta: int | None = None,
+    control: Annotated[
+        str | None, Field(description="Optional post-idle/control snapshot from the same baseline.")
+    ] = None,
+    opposite: Annotated[
+        str | None, Field(description="Optional post-opposite-action snapshot from the same baseline.")
+    ] = None,
+    require_control_stable: bool = True,
+    require_opposite_direction: bool = True,
+    aligned: bool = True,
+    offset_base: Annotated[int, Field(ge=0, le=0xFFFF)] = 0,
+    limit: Annotated[int, Field(ge=1, le=2000)] = 100,
+) -> dict[str, Any]:
+    def scan() -> dict[str, Any]:
+        paths = {
+            "baseline": _input(baseline),
+            "experiment": _input(experiment),
+            "control": _input(control) if control else None,
+            "opposite": _input(opposite) if opposite else None,
+        }
+        raw = {
+            name: path.read_bytes() if path is not None else None
+            for name, path in paths.items()
+        }
+        if len(raw["baseline"]) > 1024 * 1024:
+            raise SessionError("memory scans are bounded to 1 MiB per snapshot")
+        candidates = perception.scan_memory_changes(
+            raw["baseline"],
+            raw["experiment"],
+            value_size=value_size,
+            relation=relation,
+            expected_delta=expected_delta,
+            control=raw["control"],
+            opposite=raw["opposite"],
+            require_control_stable=require_control_stable,
+            require_opposite_direction=require_opposite_direction,
+            aligned=aligned,
+            offset_base=offset_base,
+        )
+        return {
+            "snapshots": {
+                name: str(path) if path is not None else None for name, path in paths.items()
+            },
+            "bytes": len(raw["baseline"]),
+            "value_size": value_size,
+            "relation": relation,
+            "total_candidates": len(candidates),
+            "count": min(limit, len(candidates)),
+            "truncated": len(candidates) > limit,
+            "candidates": candidates[:limit],
+            "epistemic_status": "ranked memory-change evidence; meanings remain unconfirmed",
+        }
+
+    return await asyncio.to_thread(scan)
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+    description=(
+        "Rank equally sampled memory series against one numeric visual series, "
+        "such as a changed-region track centroid.  Reports Pearson correlation "
+        "of raw values and first differences, same/inverse direction, and "
+        "simple fixed scales (1, 2, 4, 8, 16, 256) where they fit.  Correlation "
+        "is evidence only; it does not establish semantics or causality."
+    ),
+)
+def dosbox_correlate_memory(
+    visual_series: Annotated[list[float], Field(min_length=3, max_length=10000)],
+    memory_series: Annotated[
+        dict[str, list[float]],
+        Field(min_length=1, max_length=1000, description="Field label to paired numeric samples."),
+    ],
+    limit: Annotated[int, Field(ge=1, le=1000)] = 100,
+) -> dict[str, Any]:
+    ranked = perception.rank_correlations(visual_series, memory_series)
+    return {
+        "visual_samples": len(visual_series),
+        "total_fields": len(ranked),
+        "count": min(limit, len(ranked)),
+        "truncated": len(ranked) > limit,
+        "correlations": ranked[:limit],
+        "epistemic_status": "numeric association only; no game semantics or causality inferred",
+    }
+
+
 @mcp.tool(
     annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
     description=(
@@ -1096,6 +1381,391 @@ async def dosbox_read_framebuffer(
         return result
 
     return await asyncio.to_thread(read)
+
+
+def _prepare_probes(
+    session: Session, probes: list[MemoryProbe]
+) -> list[tuple[str, int | None, int, int]]:
+    prepared: list[tuple[str, int | None, int, int]] = []
+    labels: set[str] = set()
+    for probe in probes:
+        segment = _segment_number(probe.segment)
+        if segment is None:
+            offset, symbol_size = session.profile.resolve(probe.offset)
+            size = probe.size if probe.size != 1 else symbol_size
+            address = f"DS:{offset:04X}"
+        else:
+            offset = int(probe.offset, 0) if isinstance(probe.offset, str) else int(probe.offset)
+            size = probe.size
+            address = f"{segment:04X}:{offset:04X}"
+        if offset < 0 or offset + size > 0x10000:
+            raise SessionError(f"memory probe {address}/{size} runs outside its 64 KiB segment")
+        label = probe.label or (str(probe.offset) if segment is None else address)
+        if label in labels:
+            raise SessionError(f"memory probe label {label!r} is repeated")
+        labels.add(label)
+        prepared.append((label, segment, offset, size))
+    return prepared
+
+
+def _read_probes(
+    session: Session, probes: list[tuple[str, int | None, int, int]]
+) -> dict[str, int]:
+    values: dict[str, int] = {}
+    named = [probe for probe in probes if probe[1] is None]
+    if named:
+        snapshot = session.segment()
+        for label, _, offset, size in named:
+            values[label] = int.from_bytes(snapshot[offset : offset + size], "little")
+
+    grouped: dict[int, list[tuple[str, int | None, int, int]]] = {}
+    for probe in probes:
+        if probe[1] is not None:
+            grouped.setdefault(probe[1], []).append(probe)
+    target = session.guest() if grouped else None
+    for segment, fields in grouped.items():
+        start = min(field[2] for field in fields)
+        end = max(field[2] + field[3] for field in fields)
+        snapshot = target.read(segment, start, end - start)
+        for label, _, offset, size in fields:
+            relative = offset - start
+            values[label] = int.from_bytes(snapshot[relative : relative + size], "little")
+    return values
+
+
+def _prepare_range(
+    session: Session, probe: MemoryRangeProbe | None
+) -> tuple[int | None, int, int] | None:
+    if probe is None:
+        return None
+    segment = _segment_number(probe.segment)
+    if segment is None:
+        offset, _ = session.profile.resolve(probe.offset)
+    else:
+        offset = int(probe.offset, 0) if isinstance(probe.offset, str) else int(probe.offset)
+    if offset < 0 or offset + probe.length > 0x10000:
+        address = "DS" if segment is None else f"{segment:04X}"
+        raise SessionError(
+            f"memory range {address}:{offset:04X}+{probe.length} runs outside its 64 KiB segment"
+        )
+    return segment, offset, probe.length
+
+
+def _read_range(session: Session, prepared: tuple[int | None, int, int]) -> bytes:
+    segment, offset, length = prepared
+    if segment is None:
+        return session.read(offset, length)
+    return session.guest().read(segment, offset, length)
+
+
+def _perform_action(session: Session, action: ExperimentAction, observation_seconds: float):
+    if action.kind == "idle":
+        if action.keys:
+            raise SessionError("kind=idle cannot also contain keys")
+        return {
+            "kind": "idle",
+            "transport": "none",
+            "result": "control observation; no input was applied",
+        }
+    if action.kind == "keys":
+        if not action.keys:
+            raise SessionError("kind=keys requires at least one key")
+        action_time = max(0, len(action.keys) - 1) * action.pace_seconds
+        if action_time > observation_seconds:
+            raise SessionError(
+                f"paced key action takes {action_time:.3f}s, longer than the "
+                f"{observation_seconds:.3f}s observation"
+            )
+        sent = session.press(action.keys, action.pace_seconds)
+        return {
+            "kind": "keys",
+            "transport": "bios_keyboard_ring",
+            "sent": sent,
+            "limitation": (
+                "BIOS queue events are not held/raw keyboard state and may not be "
+                "consumed by action games that read IRQ1, port 0x60, or a key-state table."
+            ),
+        }
+    if action.duration_seconds > observation_seconds:
+        raise SessionError(
+            f"action duration {action.duration_seconds:.3f}s is longer than the "
+            f"{observation_seconds:.3f}s observation"
+        )
+    if action.kind == "click":
+        if action.x is None or action.y is None:
+            raise SessionError("kind=click requires x and y")
+        if not (
+            0 <= action.x < session.profile.screen_width
+            and 0 <= action.y < session.profile.screen_height
+        ):
+            raise SessionError(
+                f"({action.x},{action.y}) is outside the {session.profile.screen_width}x"
+                f"{session.profile.screen_height} guest screen"
+            )
+        writes = session.click(
+            action.x, action.y, action.duration_seconds, action.buttons
+        )
+        return {
+            "kind": "click",
+            "transport": "profile_mouse_state",
+            "x": action.x,
+            "y": action.y,
+            "buttons": action.buttons,
+            "writes": writes,
+        }
+    result = session.hold(action.buttons, action.duration_seconds)
+    return {
+        "kind": "hold_buttons",
+        "transport": "profile_mouse_state",
+        "buttons": action.buttons,
+        **result,
+    }
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+    description=(
+        "Run one bounded causal experiment in the live guest: capture a baseline "
+        "indexed frame and requested memory, apply one existing valid input "
+        "action, observe distinct frames and memory samples, then return exact "
+        "visual differences, neutral region tracks, before/after fields, and an "
+        "optional unknown-memory change scan.  Keys use the BIOS ring and the "
+        "result explicitly reports that this is NOT held/raw keyboard input.  "
+        "Use action.kind=idle for a control experiment.  Give stem to retain "
+        "raw indexed frames and before/after memory snapshots for later branch "
+        "comparison with dosbox_compare_frames and dosbox_scan_changes."
+    ),
+)
+async def dosbox_act_and_observe(
+    action: ExperimentAction,
+    duration_seconds: Annotated[float, Field(gt=0, le=30)] = 1.0,
+    pid: int | None = None,
+    interval_seconds: Annotated[
+        float, Field(ge=0.01, le=1, description="Framebuffer/memory polling interval.")
+    ] = 0.02,
+    memory_fields: Annotated[
+        list[MemoryProbe] | None,
+        Field(max_length=64, description="Numeric fields sampled at each poll."),
+    ] = None,
+    memory_range: MemoryRangeProbe | None = None,
+    reference: Annotated[
+        str | None, Field(description="Current indexed frame path used to confirm the VRAM page.")
+    ] = None,
+    allow_unconfirmed: Annotated[
+        bool, Field(description="Accept an unconfirmed framebuffer scan; verify it yourself.")
+    ] = False,
+    bridge_radius: Annotated[int, Field(ge=0, le=32)] = 1,
+    min_changed_pixels: Annotated[int, Field(ge=1)] = 1,
+    max_frames: Annotated[int, Field(ge=2, le=2000)] = 200,
+    max_samples: Annotated[int, Field(ge=3, le=2000)] = 500,
+    stem: Annotated[
+        str | None, Field(description="Optional output stem for indexed/PNG frames and memory snapshots.")
+    ] = None,
+) -> dict[str, Any]:
+    session = _session(pid)
+
+    def experiment() -> dict[str, Any]:
+        estimated_samples = int(duration_seconds / interval_seconds) + 2
+        if estimated_samples > max_samples:
+            raise SessionError(
+                f"this interval can produce about {estimated_samples} samples; "
+                f"increase interval_seconds or max_samples (currently {max_samples})"
+            )
+        _locate_framebuffer(session, reference, allow_unconfirmed)
+        buffer = session.framebuffer()
+        prepared_fields = _prepare_probes(session, memory_fields or [])
+        prepared_range = _prepare_range(session, memory_range)
+        if (
+            memory_range is not None
+            and memory_range.relation == "delta"
+            and memory_range.expected_delta is None
+        ):
+            raise SessionError("memory_range relation='delta' requires expected_delta")
+
+        baseline_page = buffer.read()
+        baseline_values = _read_probes(session, prepared_fields)
+        baseline_range = _read_range(session, prepared_range) if prepared_range else None
+        frames: list[dict[str, Any]] = [
+            {"t_ms": 0, "page": baseline_page, "memory": baseline_values}
+        ]
+        samples: list[dict[str, Any]] = [{"t_ms": 0, **baseline_values}]
+        distinct_count = 1
+        last_page = baseline_page
+        dropped = 0
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            action_future = executor.submit(
+                _perform_action, session, action, duration_seconds
+            )
+            started = time.monotonic()
+            next_poll = started + interval_seconds
+            while True:
+                now = time.monotonic()
+                if now >= started + duration_seconds:
+                    break
+                if action_future.done() and action_future.exception() is not None:
+                    action_future.result()
+                if now < next_poll:
+                    time.sleep(min(next_poll - now, interval_seconds))
+                    continue
+                elapsed_ms = int((now - started) * 1000)
+                page = buffer.read()
+                values = _read_probes(session, prepared_fields)
+                samples.append({"t_ms": elapsed_ms, **values})
+                if page != last_page:
+                    distinct_count += 1
+                    if len(frames) < max_frames:
+                        frames.append({"t_ms": elapsed_ms, "page": page, "memory": values})
+                    else:
+                        dropped += 1
+                    last_page = page
+                next_poll += interval_seconds
+            action_result = action_future.result()
+
+        final_ms = int((time.monotonic() - started) * 1000)
+        final_page = buffer.read()
+        final_values = _read_probes(session, prepared_fields)
+        samples.append({"t_ms": final_ms, **final_values})
+        if final_page != last_page:
+            distinct_count += 1
+            if len(frames) < max_frames:
+                frames.append({"t_ms": final_ms, "page": final_page, "memory": final_values})
+            else:
+                dropped += 1
+        final_range = _read_range(session, prepared_range) if prepared_range else None
+
+        comparisons = [
+            perception.compare_frames(
+                before["page"],
+                after["page"],
+                session.profile.screen_width,
+                session.profile.screen_height,
+                bridge_radius=bridge_radius,
+                min_changed_pixels=min_changed_pixels,
+            )
+            for before, after in zip(frames, frames[1:])
+        ]
+        tracking = perception.track_regions(comparisons)
+        for track in tracking["tracks"]:
+            for observation in track["history"]:
+                transition = int(observation["transition"])
+                if transition < len(frames):
+                    observation["t_ms"] = frames[transition]["t_ms"]
+                    observation["memory"] = frames[transition]["memory"]
+            if len(track["history"]) >= 3 and prepared_fields:
+                memory_series = {
+                    label: [entry["memory"][label] for entry in track["history"]]
+                    for label, _, _, _ in prepared_fields
+                }
+                track["memory_correlations"] = {
+                    "centroid_x": perception.rank_correlations(
+                        [entry["centroid"][0] for entry in track["history"]], memory_series
+                    ),
+                    "centroid_y": perception.rank_correlations(
+                        [entry["centroid"][1] for entry in track["history"]], memory_series
+                    ),
+                }
+
+        baseline_final = perception.compare_frames(
+            baseline_page,
+            final_page,
+            session.profile.screen_width,
+            session.profile.screen_height,
+            bridge_radius=bridge_radius,
+            min_changed_pixels=min_changed_pixels,
+        )
+        fields = {
+            label: {
+                "address": (
+                    f"DS:{offset:04X}" if segment is None else f"{segment:04X}:{offset:04X}"
+                ),
+                "size": size,
+                "before": baseline_values[label],
+                "after": final_values[label],
+                "delta": final_values[label] - baseline_values[label],
+            }
+            for label, segment, offset, size in prepared_fields
+        }
+        memory_result: dict[str, Any] = {"fields": fields, "samples": samples}
+        if memory_range is not None and baseline_range is not None and final_range is not None:
+            candidates = perception.scan_memory_changes(
+                baseline_range,
+                final_range,
+                value_size=memory_range.value_size,
+                relation=memory_range.relation,
+                expected_delta=memory_range.expected_delta,
+                aligned=memory_range.aligned,
+                offset_base=prepared_range[1],
+            )
+            memory_result["range"] = {
+                "segment": (
+                    "profile_data_segment"
+                    if prepared_range[0] is None
+                    else f"{prepared_range[0]:04X}"
+                ),
+                "offset": prepared_range[1],
+                "length": prepared_range[2],
+                "value_size": memory_range.value_size,
+                "relation": memory_range.relation,
+                "total_candidates": len(candidates),
+                "truncated": len(candidates) > memory_range.candidate_limit,
+                "candidates": candidates[: memory_range.candidate_limit],
+            }
+
+        files: list[str] = []
+        if stem:
+            target = _output(stem)
+            palette = (
+                vga.palette_bytes(session.profile.palette) if session.profile.palette else None
+            )
+            for index, entry in enumerate(frames):
+                frame_stem = target.with_name(f"{target.name}_frame_{index:03d}")
+                raw_path = frame_stem.with_suffix(".bin")
+                png_path = frame_stem.with_suffix(".png")
+                raw_path.write_bytes(entry["page"])
+                png_path.write_bytes(
+                    vga.png(
+                        entry["page"],
+                        palette,
+                        session.profile.screen_width,
+                        session.profile.screen_height,
+                    )
+                )
+                files.extend((str(raw_path), str(png_path)))
+            if baseline_range is not None and final_range is not None:
+                before_path = target.with_name(f"{target.name}_memory_before.bin")
+                after_path = target.with_name(f"{target.name}_memory_after.bin")
+                before_path.write_bytes(baseline_range)
+                after_path.write_bytes(final_range)
+                files.extend((str(before_path), str(after_path)))
+
+        return {
+            "pid": session.pid,
+            "action": action_result,
+            "duration_ms": final_ms,
+            "visual": {
+                "distinct_frames": distinct_count,
+                "kept_frames": len(frames),
+                "dropped_frames": dropped,
+                "frame_times_ms": [entry["t_ms"] for entry in frames],
+                "baseline_to_final": baseline_final.as_dict(),
+                "transitions": [comparison.as_dict() for comparison in comparisons],
+                "tracking": tracking,
+            },
+            "memory": memory_result,
+            "files": files,
+            "epistemic_status": (
+                "observed visual/memory evidence; track IDs and candidate offsets have no "
+                "game semantics unless independently confirmed"
+            ),
+        }
+
+    return await asyncio.to_thread(experiment)
 
 
 @mcp.tool(

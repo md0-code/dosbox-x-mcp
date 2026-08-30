@@ -201,6 +201,7 @@ class Located:
     page_offset: int          # in de-interleaved (CPU) bytes
     coherence: float
     confirmed: bool           # every byte equalled a reference
+    storage: str = "chain4"   # DOSBox-X keeps VGA indices chained or linear
 
     #: Kept for callers that spelled it the old way.
     @property
@@ -214,6 +215,7 @@ class Located:
             "page_offset": self.page_offset,
             "coherence": round(self.coherence, 4),
             "confirmed": self.confirmed,
+            "storage": self.storage,
             "note": (
                 "every byte matched the reference"
                 if self.confirmed
@@ -259,6 +261,14 @@ class Framebuffer:
                 if found is not None:
                     self.found = found
                     return found
+                # Current DOSBox-X builds can retain the indexed draw surface
+                # linearly instead of in the older chain-4 backing layout.
+                # The full-frame comparison keeps this path just as strict.
+                found = self._match_reference(raw, base, size, reference,
+                                              storage="linear")
+                if found is not None:
+                    self.found = found
+                    return found
                 continue
             found = self._score(flat, base, size)
             if found is not None and (best is None or found.coherence > best.coherence):
@@ -281,7 +291,8 @@ class Framebuffer:
         return best
 
     def _match_reference(
-        self, flat: bytes, base: int, size: int, reference: bytes
+        self, flat: bytes, base: int, size: int, reference: bytes,
+        storage: str = "chain4",
     ) -> Located | None:
         row = busiest_row(reference, self.width, self.height)
         needle = reference[row * self.width : (row + 1) * self.width]
@@ -289,7 +300,7 @@ class Framebuffer:
         while at >= 0:
             start = at - row * self.width
             if start >= 0 and flat[start : start + self.page] == reference:
-                return Located(base, size, start, 1.0, True)
+                return Located(base, size, start, 1.0, True, storage)
             at = flat.find(needle, at + 1)
         return None
 
@@ -332,6 +343,11 @@ class Framebuffer:
         if self.found is None:
             raise VgaError("locate() has not found a page yet")
         start = self.found.page_offset if page_offset is None else page_offset
+        if self.found.storage == "linear":
+            raw = self.process.read(self.found.region_base + start, self.page)
+            if raw is None or len(raw) < self.page:
+                raise VgaError("the linear video-memory region vanished mid-read")
+            return raw[: self.page]
         # Read only the linear span the page occupies -- four bytes of video
         # memory per screen byte -- rather than the whole region every time.
         raw = self.process.read(
@@ -348,7 +364,8 @@ class Framebuffer:
         """The page offsets that fit inside the located region."""
         if self.found is None:
             return []
-        room = (self.found.region_size // 4) - self.found.page_offset
+        divisor = 1 if self.found.storage == "linear" else 4
+        room = (self.found.region_size // divisor) - self.found.page_offset
         return [
             self.found.page_offset + index * self.page
             for index in range(max(1, min(MAX_PAGES, room // self.page)))

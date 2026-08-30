@@ -127,6 +127,8 @@ there is never any doubt where a file went.
 | `dosbox_act_and_observe` | one bounded action plus its visual and memory consequences |
 | `dosbox_try_actions` | restore one isolated save-state baseline before each labelled trial |
 | `dosbox_probe_controls` | rank repeated authentic held-key responses above idle motion |
+| `dosbox_build_world_mosaic` | stitch indexed frames in measured camera coordinates, retaining conflicts |
+| `dosbox_infer_movement_constraints` | find repeated requested-direction stalls without calling them collisions |
 | `dosbox_scan_changes` | rank 1-, 2- or 4-byte fields across experiment/control snapshots |
 | `dosbox_correlate_memory` | correlate a visual numeric series with candidate memory series |
 | `dosbox_evidence_notebook` | persist observed, inferred and confirmed claims outside profiles |
@@ -307,6 +309,39 @@ dosbox_evidence_notebook(
 
 Notebook revisions retain their history and use the explicit statuses
 `observed`, `inferred`, and `confirmed`.
+
+After camera translation is understood, stitch frames into an indexed world
+mosaic. Supply measured translations or let the tool run the same bounded
+translation detector. It writes the raw mosaic, a PNG, and a coverage map;
+overlap conflicts remain counted rather than being silently repaired:
+
+```text
+dosbox_build_world_mosaic(
+  frames=["flight_000.bin", "flight_001.bin", "flight_002.bin"],
+  translations=[{"dx":-4,"dy":0},{"dx":-4,"dy":0}],
+  stem="experiments/world", infer_tiles=true,
+  candidate_tile_sizes=[4,8,16,32])
+```
+
+Optional tile inference ranks exact repeated block grids, then writes a raw
+tile catalogue and integer tile map. Those IDs carry no terrain or collision
+meaning until supported by separate evidence.
+
+Repeated position samples can identify places where requested motion made no
+forward progress. The result deliberately calls these `movement_constraints`,
+not walls or collisions:
+
+```text
+dosbox_infer_movement_constraints(
+  trials=[
+    {"label":"right_a","direction":{"x":1,"y":0},
+     "positions":[{"x":10,"y":20},{"x":11,"y":20},{"x":11,"y":20},
+                  {"x":11,"y":20},{"x":11,"y":20}]},
+    {"label":"right_b","direction":{"x":1,"y":0},
+     "positions":[{"x":9,"y":20},{"x":11,"y":20},{"x":11,"y":20},
+                  {"x":11,"y":20},{"x":11,"y":20}]}
+  ])
+```
 
 Frame processing is dependency-free and practical for 320×200 indexed modes.
 Large whole-screen transitions reset associations instead of creating hundreds

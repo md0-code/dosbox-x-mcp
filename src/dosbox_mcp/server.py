@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import json
 import os
 import subprocess
 import sys
@@ -36,6 +37,7 @@ from . import (
     platform as host,
     trace as tracing,
     vga,
+    world as world_model,
 )
 from .profile import Profile, ProfileError, load_profile
 from .raw_keyboard import resolve_raw_key
@@ -71,6 +73,8 @@ mcp = FastMCP(
         "when DOSBox-X has the companion keyboard hook.  "
         "dosbox_evidence_notebook persists observed, inferred, and confirmed "
         "claims separately from authoritative profiles.  "
+        "dosbox_build_world_mosaic and dosbox_infer_movement_constraints add "
+        "later-stage spatial evidence without asserting map semantics.  "
         "dosbox_capabilities says what this host can do before anything is tried."
     ),
 )
@@ -293,6 +297,28 @@ class BranchTrial(BaseModel):
 
     label: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_.-]+$")
     action: ExperimentAction
+
+
+class TranslationStep(BaseModel):
+    """Measured prior-frame pixel displacement into the next frame."""
+
+    dx: int = Field(ge=-4096, le=4096)
+    dy: int = Field(ge=-4096, le=4096)
+
+
+class PositionSample(BaseModel):
+    """One measured position in a consistent coordinate system."""
+
+    x: float
+    y: float
+
+
+class MovementTrial(BaseModel):
+    """A requested direction and measured positions from one controlled trial."""
+
+    label: str = Field(min_length=1, max_length=64)
+    direction: PositionSample
+    positions: list[PositionSample] = Field(min_length=2, max_length=10000)
 
 
 # ── discovery and lifecycle ────────────────────────────────────────────────
@@ -1373,6 +1399,177 @@ async def dosbox_compare_frames(
         return result
 
     return await asyncio.to_thread(compare)
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+    description=(
+        "Stitch saved indexed frames into a raw world mosaic using supplied or "
+        "automatically measured global translations. The first observed palette "
+        "index is retained at each world coordinate; coverage and conflict maps "
+        "show where later frames agreed or differed. Conflicts and ambiguous "
+        "translations remain explicit evidence and are never silently repaired."
+    ),
+)
+async def dosbox_build_world_mosaic(
+    frames: Annotated[
+        list[str], Field(min_length=2, max_length=100, description="Indexed frames in time order.")
+    ],
+    stem: Annotated[str, Field(description="Output stem for .bin, .png, and _coverage.bin.")],
+    width: Annotated[int, Field(ge=1, le=4096)] = 320,
+    height: Annotated[int, Field(ge=1, le=4096)] = 200,
+    translations: Annotated[
+        list[TranslationStep] | None,
+        Field(description="Optional one measured prior-to-next translation per transition."),
+    ] = None,
+    max_translation_x: Annotated[int, Field(ge=0, le=128)] = 16,
+    max_translation_y: Annotated[int, Field(ge=0, le=128)] = 16,
+    translation_sample_stride: Annotated[int, Field(ge=1, le=16)] = 2,
+    palette: Annotated[
+        str | None, Field(description="Optional 768-byte six-bit DAC palette path.")
+    ] = None,
+    infer_tiles: bool = False,
+    candidate_tile_sizes: Annotated[list[int], Field(min_length=1, max_length=16)] = [
+        4,
+        8,
+        16,
+        32,
+    ],
+    minimum_observed_tiles: Annotated[int, Field(ge=2, le=100000)] = 8,
+    max_mosaic_pixels: Annotated[int, Field(ge=1, le=64 * 1024 * 1024)] = 64 * 1024 * 1024,
+) -> dict[str, Any]:
+    def stitch() -> dict[str, Any]:
+        loaded = [_indexed_frame(path, width, height) for path in frames]
+        motion_reports: list[dict[str, object]] = []
+        if translations is None:
+            steps = []
+            for before, after in zip(loaded, loaded[1:]):
+                motion = perception.detect_translation(
+                    before[1],
+                    after[1],
+                    width,
+                    height,
+                    max_dx=max_translation_x,
+                    max_dy=max_translation_y,
+                    sample_stride=translation_sample_stride,
+                )
+                motion_reports.append(motion)
+                dx, dy = motion["best_translation"]
+                steps.append((int(dx), int(dy)))
+            translation_source = "automatically measured indexed-pixel translation"
+        else:
+            if len(translations) != len(loaded) - 1:
+                raise SessionError(
+                    f"received {len(translations)} translations for {len(loaded)} frames; "
+                    f"expected {len(loaded) - 1}"
+                )
+            steps = [(step.dx, step.dy) for step in translations]
+            translation_source = "caller-supplied measured translation"
+
+        mosaic = world_model.build_mosaic(
+            [item[1] for item in loaded],
+            steps,
+            width,
+            height,
+            max_mosaic_pixels=max_mosaic_pixels,
+        )
+        target = _output(stem)
+        raw_path = target.with_suffix(".bin")
+        png_path = target.with_suffix(".png")
+        coverage_path = target.with_name(f"{target.name}_coverage.bin")
+        palette_bytes = _input(palette).read_bytes() if palette else None
+        if palette_bytes is not None and len(palette_bytes) != 768:
+            raise SessionError(
+                f"palette {_input(palette)} has {len(palette_bytes)} bytes; expected 768"
+            )
+        raw_path.write_bytes(mosaic.pixels)
+        coverage_path.write_bytes(mosaic.coverage)
+        png_path.write_bytes(
+            vga.png(mosaic.pixels, palette_bytes, mosaic.width, mosaic.height)
+        )
+        result = {
+            **mosaic.report(),
+            "frames": [str(item[0]) for item in loaded],
+            "translations": [list(step) for step in steps],
+            "translation_source": translation_source,
+            "translation_evidence": motion_reports,
+            "ambiguous_transitions": [
+                index
+                for index, motion in enumerate(motion_reports, start=1)
+                if float(motion["confidence"]) < 0.5
+            ],
+            "files": {
+                "indexed_mosaic": str(raw_path),
+                "png": str(png_path),
+                "coverage": str(coverage_path),
+            },
+        }
+        if infer_tiles:
+            structure = world_model.infer_tile_structure(
+                mosaic.pixels,
+                mosaic.coverage,
+                mosaic.width,
+                mosaic.height,
+                candidate_sizes=candidate_tile_sizes,
+                min_tiles=minimum_observed_tiles,
+            )
+            tiles_path = target.with_name(f"{target.name}_tiles.bin")
+            tilemap_path = target.with_name(f"{target.name}_tilemap.json")
+            tiles_path.write_bytes(structure.tile_bytes)
+            tile_file_report = structure.report(include_tile_map=True)
+            tilemap_path.write_text(
+                json.dumps(tile_file_report, indent=2) + "\n", encoding="utf-8"
+            )
+            tile_report = structure.report(include_tile_map=False)
+            result["tile_structure"] = tile_report
+            result["files"]["tile_catalogue"] = str(tiles_path)
+            result["files"]["tile_map"] = str(tilemap_path)
+        return result
+
+    return await asyncio.to_thread(stitch)
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+    description=(
+        "Find repeated positions where a requested direction produced too little "
+        "projected progress for several consecutive samples. Only candidates "
+        "supported by the requested number of independently labelled trials are "
+        "returned. These are movement constraints, not asserted walls or collisions."
+    ),
+)
+def dosbox_infer_movement_constraints(
+    trials: Annotated[list[MovementTrial], Field(min_length=1, max_length=100)],
+    max_projected_progress: Annotated[float, Field(ge=0)] = 0.25,
+    min_stalled_steps: Annotated[int, Field(ge=1, le=10000)] = 3,
+    position_tolerance: Annotated[float, Field(ge=0)] = 2.0,
+    min_trial_support: Annotated[int, Field(ge=1, le=100)] = 2,
+) -> dict[str, object]:
+    prepared = [
+        {
+            "label": trial.label,
+            "direction": [trial.direction.x, trial.direction.y],
+            "positions": [[sample.x, sample.y] for sample in trial.positions],
+        }
+        for trial in trials
+    ]
+    return world_model.infer_movement_constraints(
+        prepared,
+        max_projected_progress=max_projected_progress,
+        min_stalled_steps=min_stalled_steps,
+        position_tolerance=position_tolerance,
+        min_trial_support=min_trial_support,
+    )
 
 
 @mcp.tool(

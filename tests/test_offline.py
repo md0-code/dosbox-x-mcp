@@ -510,6 +510,30 @@ def test_recording_suffixes_are_not_all_dro():
     assert emulator.SUFFIXES["record_wave"] == (".wav",)
 
 
+def test_branch_save_does_not_accept_a_stale_slot(monkeypatch, tmp_path):
+    (tmp_path / "100.sav").write_bytes(b"old state")
+    moments = iter((0.0, 0.01, 0.02, 0.03, 0.2))
+    monkeypatch.setattr(emulator, "command", lambda pid, action: {"action": action})
+    monkeypatch.setattr(emulator.time, "monotonic", lambda: next(moments))
+    monkeypatch.setattr(emulator.time, "sleep", lambda seconds: None)
+    with pytest.raises(emulator.EmulatorError, match="did not finish"):
+        emulator.save_branch_state(42, tmp_path, timeout=0.1)
+
+
+def test_branch_save_waits_for_a_new_stable_slot(monkeypatch, tmp_path):
+    target = tmp_path / "100.sav"
+    target.write_bytes(b"old")
+
+    def save(pid, action):
+        target.write_bytes(b"new complete state")
+        return {"action": action}
+
+    monkeypatch.setattr(emulator, "command", save)
+    monkeypatch.setattr(emulator.time, "sleep", lambda seconds: None)
+    result = emulator.save_branch_state(42, tmp_path)
+    assert result["bytes"] == len(b"new complete state")
+
+
 # ── the platform layer ─────────────────────────────────────────────────────
 
 

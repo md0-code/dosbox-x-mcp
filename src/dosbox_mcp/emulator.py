@@ -129,6 +129,7 @@ def launch(
     config: Path,
     working_directory: str | None = None,
     isolated: bool = False,
+    save_directory: Path | None = None,
 ) -> tuple[subprocess.Popen, Display | None]:
     """Start the emulator, optionally on a display of its own."""
     display: Display | None = None
@@ -138,8 +139,20 @@ def launch(
         display = start_display()
         environment["DISPLAY"] = display.name
     try:
+        arguments = [str(executable), "-conf", str(config)]
+        if save_directory is not None:
+            arguments.extend(
+                [
+                    "-savedir",
+                    str(save_directory),
+                    "-set",
+                    "dosbox saveslot=100",
+                    "-set",
+                    "dosbox saveremark=false",
+                ]
+            )
         process = subprocess.Popen(
-            [str(executable), "-conf", str(config)],
+            arguments,
             cwd=working_directory or str(executable.parent),
             env=environment,
             stdout=subprocess.DEVNULL,
@@ -167,6 +180,49 @@ def command(pid: int, action: str) -> dict[str, object]:
     identifier, label = host.resolve_command(handle, action)
     host.menu_command(handle, identifier)
     return {"action": action, "menu_item": label, "command_id": f"{identifier:#06x}"}
+
+
+def save_branch_state(pid: int, directory: Path, timeout: float = 15.0) -> dict[str, object]:
+    """Save isolated slot 100 and wait until its archive is complete."""
+    target = directory / "100.sav"
+    try:
+        existing = target.stat()
+        before = (existing.st_mtime_ns, existing.st_size)
+    except OSError:
+        before = None
+    started = time.monotonic()
+    result = command(pid, "save_state")
+    previous: tuple[int, int] | None = None
+    stable = 0
+    while time.monotonic() - started < timeout:
+        try:
+            stat = target.stat()
+            current = (stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            current = None
+        if current is not None and current[1] > 0 and current != before and current == previous:
+            stable += 1
+            if stable >= 2:
+                return {
+                    **result,
+                    "state_file": str(target),
+                    "bytes": current[1],
+                    "waited_seconds": round(time.monotonic() - started, 3),
+                }
+        else:
+            stable = 0
+        previous = current
+        time.sleep(0.05)
+    raise EmulatorError(f"DOSBox-X did not finish isolated state {target} within {timeout}s")
+
+
+def load_branch_state(pid: int, state_file: Path, settle: float = 0.25) -> dict[str, object]:
+    """Load isolated slot 100 after verifying the expected archive exists."""
+    if not state_file.is_file() or state_file.stat().st_size == 0:
+        raise EmulatorError(f"isolated branch state is missing or empty: {state_file}")
+    result = command(pid, "load_state")
+    time.sleep(settle)
+    return {**result, "state_file": str(state_file), "settle_seconds": settle}
 
 
 def record(

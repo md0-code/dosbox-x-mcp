@@ -28,8 +28,17 @@ from pydantic import BaseModel, Field
 from mcp.server.fastmcp import FastMCP, Image
 from mcp.types import ToolAnnotations
 
-from . import emulator, guest as dosguest, perception, platform as host, trace as tracing, vga
+from . import (
+    emulator,
+    evidence as evidence_store,
+    guest as dosguest,
+    perception,
+    platform as host,
+    trace as tracing,
+    vga,
+)
 from .profile import Profile, ProfileError, load_profile
+from .raw_keyboard import resolve_raw_key
 from .screen import CaptureError, capture_window, downscale_png, write_outputs
 from .session import Condition, Registry, Session, SessionError
 from .platform import ProcessError, find_windows
@@ -60,6 +69,8 @@ mcp = FastMCP(
         "memory experiments without assigning game semantics to the evidence.  "
         "dosbox_key_state and dosbox_hold_keys provide real make/break input "
         "when DOSBox-X has the companion keyboard hook.  "
+        "dosbox_evidence_notebook persists observed, inferred, and confirmed "
+        "claims separately from authoritative profiles.  "
         "dosbox_capabilities says what this host can do before anything is tried."
     ),
 )
@@ -277,6 +288,13 @@ class ExperimentAction(BaseModel):
     )
 
 
+class BranchTrial(BaseModel):
+    """One labelled action run from the same restored emulator state."""
+
+    label: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_.-]+$")
+    action: ExperimentAction
+
+
 # ── discovery and lifecycle ────────────────────────────────────────────────
 
 
@@ -348,6 +366,15 @@ async def dosbox_launch(
     isolated: Annotated[
         bool, Field(description="Linux only: run on a private Xvfb display.")
     ] = False,
+    state_directory: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Isolated DOSBox-X save-slot directory. Required by "
+                "dosbox_try_actions so experiments never overwrite personal slots."
+            )
+        ),
+    ] = None,
 ) -> dict[str, Any]:
     resolved = _resolve_profile(profile)
     binary = executable or DEFAULT_EXECUTABLE
@@ -362,12 +389,20 @@ async def dosbox_launch(
     if not config_path.is_file():
         raise SessionError(f"no config file at {config_path}")
 
+    state_path = Path(state_directory).resolve() if state_directory else None
+    if state_path is not None:
+        state_path.mkdir(parents=True, exist_ok=True)
     process, display = emulator.launch(
-        binary_path, config_path, working_directory, isolated=isolated
+        binary_path,
+        config_path,
+        working_directory,
+        isolated=isolated,
+        save_directory=state_path,
     )
     session = registry.attach(process.pid, resolved)
     session.display = display
     session.config = config_path
+    session.state_directory = state_path
     registry.mark_launched(process.pid)
 
     def settle() -> str:
@@ -400,6 +435,7 @@ async def dosbox_launch(
         "config": str(config_path),
         "captures_directory": str(emulator.captures_directory(config_path)),
         "raw_keyboard": session.raw_keyboard_supported(),
+        "state_directory": str(state_path) if state_path is not None else None,
     }
 
 
@@ -462,6 +498,11 @@ def dosbox_sessions(window_title: str | None = None) -> dict[str, Any]:
                 ),
                 "segment_scans": session.scans,
                 "raw_keyboard": session.raw_keyboard_supported(),
+                "state_directory": (
+                    str(session.state_directory)
+                    if session.state_directory is not None
+                    else None
+                ),
             }
         )
     return {"attached": sessions, "windows": windows}
@@ -955,6 +996,64 @@ def dosbox_capabilities() -> dict[str, Any]:
 
 
 @mcp.tool(
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=False,
+    ),
+    description=(
+        "List, record, revise, or delete entries in a project evidence notebook. "
+        "Each entry is explicitly observed, inferred, or confirmed and retains "
+        "its evidence/history. The notebook is a separate JSON file and never "
+        "changes an authoritative game profile. Use concrete measurements as "
+        "evidence; status and labels are caller assertions."
+    ),
+)
+async def dosbox_evidence_notebook(
+    operation: Literal["list", "upsert", "delete"] = "list",
+    path: Annotated[
+        str, Field(description="Notebook path, relative to DOSBOX_MCP_OUTPUT_DIR by default.")
+    ] = "evidence.json",
+    subject: Annotated[
+        str | None, Field(description="Stable subject such as memory:DS:19A4 or visual:track:7.")
+    ] = None,
+    status: Literal["observed", "inferred", "confirmed"] | None = None,
+    evidence: Annotated[list[str] | None, Field(max_length=32)] = None,
+    label: Annotated[str | None, Field(max_length=128)] = None,
+    confidence: Annotated[float | None, Field(ge=0, le=1)] = None,
+) -> dict[str, Any]:
+    target = _output(path)
+    if operation == "list":
+        found = await asyncio.to_thread(
+            evidence_store.entries, target, status, subject
+        )
+        return {
+            "path": str(target),
+            "count": len(found),
+            "entries": found,
+            "note": "notebook claims are separate from authoritative profile facts",
+        }
+    if subject is None or not subject.strip():
+        raise SessionError(f"operation={operation} requires subject")
+    if operation == "delete":
+        removed = await asyncio.to_thread(evidence_store.remove, target, subject)
+        return {"path": str(target), "subject": subject, "removed": removed}
+    if status is None:
+        raise SessionError("operation=upsert requires status")
+    entry = await asyncio.to_thread(
+        evidence_store.upsert,
+        target,
+        subject,
+        status,
+        evidence or [],
+        label,
+        confidence,
+    )
+    return {"path": str(target), "entry": entry}
+
+
+@mcp.tool(
     annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
     description=(
         "Find the DOS guest inside an emulator process and report what is "
@@ -1184,7 +1283,8 @@ def _indexed_frame(path: str, width: int, height: int) -> tuple[Path, bytes]:
         "dosbox_read_framebuffer or dosbox_act_and_observe.  bridge_radius can "
         "join the separated old/new footprints of a moving shape.  Track IDs "
         "are visual associations only, never claims that a region is a player, "
-        "enemy, wall, or other game object."
+        "enemy, wall, or other game object.  Set detect_global_motion to search "
+        "bounded whole-frame translations and report residual local changes."
     ),
 )
 async def dosbox_compare_frames(
@@ -1204,6 +1304,12 @@ async def dosbox_compare_frames(
     track_max_distance: Annotated[float, Field(gt=0, le=1024)] = 48.0,
     track_max_missed: Annotated[int, Field(ge=0, le=20)] = 1,
     global_change_fraction: Annotated[float, Field(gt=0, le=1)] = 0.35,
+    detect_global_motion: bool = False,
+    max_translation_x: Annotated[int, Field(ge=0, le=128)] = 16,
+    max_translation_y: Annotated[int, Field(ge=0, le=128)] = 16,
+    translation_sample_stride: Annotated[int, Field(ge=1, le=16)] = 2,
+    infer_screen_layout: bool = False,
+    min_scroll_episodes: Annotated[int, Field(ge=1, le=99)] = 2,
 ) -> dict[str, Any]:
     def compare() -> dict[str, Any]:
         loaded = [_indexed_frame(path, width, height) for path in frames]
@@ -1220,15 +1326,29 @@ async def dosbox_compare_frames(
             for before, after in zip(loaded, loaded[1:])
         ]
         transitions = []
+        motions: list[dict[str, object]] = []
         for index, evidence in enumerate(comparisons):
-            transitions.append(
-                {
-                    "from": str(loaded[index][0]),
-                    "to": str(loaded[index + 1][0]),
-                    **evidence.as_dict(),
-                }
-            )
-        return {
+            transition = {
+                "from": str(loaded[index][0]),
+                "to": str(loaded[index + 1][0]),
+                **evidence.as_dict(),
+            }
+            if detect_global_motion or infer_screen_layout:
+                motion = perception.detect_translation(
+                    loaded[index][1],
+                    loaded[index + 1][1],
+                    width,
+                    height,
+                    max_dx=max_translation_x,
+                    max_dy=max_translation_y,
+                    sample_stride=translation_sample_stride,
+                    bridge_radius=bridge_radius,
+                    min_changed_pixels=min_changed_pixels,
+                )
+                motions.append(motion)
+                transition["global_motion"] = motion
+            transitions.append(transition)
+        result: dict[str, Any] = {
             "frame_count": len(loaded),
             "transitions": transitions,
             "tracking": perception.track_regions(
@@ -1239,6 +1359,18 @@ async def dosbox_compare_frames(
             ),
             "epistemic_status": "observed visual evidence; no game semantics inferred",
         }
+        if infer_screen_layout:
+            if len(loaded) < 3:
+                raise SessionError("screen-layout inference needs at least three frames")
+            result["screen_regions"] = perception.infer_screen_regions(
+                [item[1] for item in loaded],
+                [tuple(motion["best_translation"]) for motion in motions],
+                width,
+                height,
+                min_episodes=min_scroll_episodes,
+                min_region_pixels=min_changed_pixels,
+            )
+        return result
 
     return await asyncio.to_thread(compare)
 
@@ -1602,7 +1734,8 @@ def _perform_action(session: Session, action: ExperimentAction, observation_seco
         "DOSBox-X companion hook.  "
         "Use action.kind=idle for a control experiment.  Give stem to retain "
         "raw indexed frames and before/after memory snapshots for later branch "
-        "comparison with dosbox_compare_frames and dosbox_scan_changes."
+        "comparison with dosbox_compare_frames and dosbox_scan_changes. Enable "
+        "global motion to measure bounded baseline-to-final camera translation."
     ),
 )
 async def dosbox_act_and_observe(
@@ -1627,6 +1760,10 @@ async def dosbox_act_and_observe(
     min_changed_pixels: Annotated[int, Field(ge=1)] = 1,
     max_frames: Annotated[int, Field(ge=2, le=2000)] = 200,
     max_samples: Annotated[int, Field(ge=3, le=2000)] = 500,
+    detect_global_motion: bool = False,
+    max_translation_x: Annotated[int, Field(ge=0, le=64)] = 16,
+    max_translation_y: Annotated[int, Field(ge=0, le=64)] = 16,
+    translation_sample_stride: Annotated[int, Field(ge=1, le=16)] = 2,
     stem: Annotated[
         str | None, Field(description="Optional output stem for indexed/PNG frames and memory snapshots.")
     ] = None,
@@ -1743,6 +1880,21 @@ async def dosbox_act_and_observe(
             bridge_radius=bridge_radius,
             min_changed_pixels=min_changed_pixels,
         )
+        global_motion = (
+            perception.detect_translation(
+                baseline_page,
+                final_page,
+                session.profile.screen_width,
+                session.profile.screen_height,
+                max_dx=max_translation_x,
+                max_dy=max_translation_y,
+                sample_stride=translation_sample_stride,
+                bridge_radius=bridge_radius,
+                min_changed_pixels=min_changed_pixels,
+            )
+            if detect_global_motion
+            else None
+        )
         fields = {
             label: {
                 "address": (
@@ -1818,6 +1970,7 @@ async def dosbox_act_and_observe(
                 "dropped_frames": dropped,
                 "frame_times_ms": [entry["t_ms"] for entry in frames],
                 "baseline_to_final": baseline_final.as_dict(),
+                "global_motion": global_motion,
                 "transitions": [comparison.as_dict() for comparison in comparisons],
                 "tracking": tracking,
             },
@@ -1830,6 +1983,255 @@ async def dosbox_act_and_observe(
         }
 
     return await asyncio.to_thread(experiment)
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+    description=(
+        "Run labelled actions from one identical DOSBox-X save-state baseline. "
+        "The server saves isolated slot 100, restores it before every trial, "
+        "collects the same exact visual/memory evidence as act_and_observe, and "
+        "restores the baseline again before returning. This requires a Windows "
+        "session launched with state_directory so personal save slots cannot be "
+        "overwritten. Results are comparative evidence, not semantic labels."
+    ),
+)
+async def dosbox_try_actions(
+    trials: Annotated[list[BranchTrial], Field(min_length=1, max_length=32)],
+    duration_seconds: Annotated[float, Field(gt=0, le=30)] = 1.0,
+    pid: int | None = None,
+    interval_seconds: Annotated[float, Field(ge=0.01, le=1)] = 0.02,
+    memory_fields: Annotated[list[MemoryProbe] | None, Field(max_length=64)] = None,
+    memory_range: MemoryRangeProbe | None = None,
+    reference: str | None = None,
+    allow_unconfirmed: bool = False,
+    bridge_radius: Annotated[int, Field(ge=0, le=32)] = 1,
+    min_changed_pixels: Annotated[int, Field(ge=1)] = 1,
+    max_frames: Annotated[int, Field(ge=2, le=2000)] = 200,
+    max_samples: Annotated[int, Field(ge=3, le=2000)] = 500,
+    detect_global_motion: bool = False,
+    max_translation_x: Annotated[int, Field(ge=0, le=64)] = 16,
+    max_translation_y: Annotated[int, Field(ge=0, le=64)] = 16,
+    translation_sample_stride: Annotated[int, Field(ge=1, le=16)] = 2,
+    restore_settle_seconds: Annotated[float, Field(ge=0.05, le=5)] = 0.25,
+    stem: Annotated[
+        str | None, Field(description="Optional output stem; trial labels are appended.")
+    ] = None,
+) -> dict[str, Any]:
+    session = _session(pid)
+    if session.state_directory is None:
+        raise SessionError(
+            "controlled branches require an isolated save directory; launch this "
+            "session with dosbox_launch(state_directory=...)"
+        )
+    host.require("menu_commands")
+    labels = [trial.label for trial in trials]
+    if len(set(labels)) != len(labels):
+        raise SessionError("branch trial labels must be unique")
+
+    session.release_all_keys()
+    await asyncio.to_thread(
+        _locate_framebuffer, session, reference, allow_unconfirmed
+    )
+    saved = await asyncio.to_thread(
+        emulator.save_branch_state, session.pid, session.state_directory
+    )
+    state_file = Path(saved["state_file"])
+    branches: list[dict[str, Any]] = []
+    restore_count = 0
+
+    async def restore() -> dict[str, object]:
+        nonlocal restore_count
+        session.release_all_keys()
+        result = await asyncio.to_thread(
+            emulator.load_branch_state,
+            session.pid,
+            state_file,
+            restore_settle_seconds,
+        )
+        session.ds_base = 0
+        session.ram_base = None
+        await asyncio.to_thread(session.locate, True)
+        restore_count += 1
+        return result
+
+    try:
+        for trial in trials:
+            restored = await restore()
+            branch_stem = f"{stem}_{trial.label}" if stem else None
+            observed = await dosbox_act_and_observe(
+                action=trial.action,
+                duration_seconds=duration_seconds,
+                pid=session.pid,
+                interval_seconds=interval_seconds,
+                memory_fields=memory_fields,
+                memory_range=memory_range,
+                reference=None,
+                allow_unconfirmed=allow_unconfirmed,
+                bridge_radius=bridge_radius,
+                min_changed_pixels=min_changed_pixels,
+                max_frames=max_frames,
+                max_samples=max_samples,
+                detect_global_motion=detect_global_motion,
+                max_translation_x=max_translation_x,
+                max_translation_y=max_translation_y,
+                translation_sample_stride=translation_sample_stride,
+                stem=branch_stem,
+            )
+            branches.append(
+                {"label": trial.label, "restore": restored, "evidence": observed}
+            )
+    finally:
+        final_restore = await restore()
+
+    return {
+        "pid": session.pid,
+        "baseline_state": saved,
+        "trials": branches,
+        "restore_count": restore_count,
+        "baseline_restored": True,
+        "final_restore": final_restore,
+        "epistemic_status": (
+            "independent branch observations from one emulator state; action labels "
+            "and measured differences do not establish game semantics"
+        ),
+    }
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+    description=(
+        "Probe candidate physical controls from one restored state, with repeated "
+        "idle controls and authentic held-key trials. Ranks the strongest visual "
+        "changed-region track response above idle motion by repeat support, "
+        "direction consistency, and track confidence. Track IDs are local visual "
+        "associations; this does not identify a player or assign control semantics."
+    ),
+)
+async def dosbox_probe_controls(
+    keys: Annotated[list[str], Field(min_length=1, max_length=12)],
+    hold_seconds: Annotated[float, Field(gt=0, le=5)] = 0.35,
+    observation_seconds: Annotated[float, Field(gt=0, le=10)] = 0.75,
+    repeats: Annotated[int, Field(ge=1, le=5)] = 2,
+    pid: int | None = None,
+    interval_seconds: Annotated[float, Field(ge=0.01, le=0.5)] = 0.025,
+    memory_fields: Annotated[list[MemoryProbe] | None, Field(max_length=32)] = None,
+    reference: str | None = None,
+    allow_unconfirmed: bool = False,
+    stem: str | None = None,
+    include_full_evidence: bool = False,
+) -> dict[str, Any]:
+    if hold_seconds > observation_seconds:
+        raise SessionError("hold_seconds cannot exceed observation_seconds")
+    try:
+        canonical = [resolve_raw_key(key).name for key in keys]
+    except ValueError as failure:
+        raise SessionError(str(failure)) from None
+    canonical = list(dict.fromkeys(canonical))
+    trials: list[BranchTrial] = []
+    metadata: dict[str, tuple[str, bool]] = {}
+    for repeat in range(repeats):
+        label = f"idle_r{repeat + 1}"
+        trials.append(BranchTrial(label=label, action=ExperimentAction(kind="idle")))
+        metadata[label] = ("idle", True)
+    for key in canonical:
+        for repeat in range(repeats):
+            label = f"{key}_r{repeat + 1}"
+            trials.append(
+                BranchTrial(
+                    label=label,
+                    action=ExperimentAction(
+                        kind="hold_keys", keys=[key], duration_seconds=hold_seconds
+                    ),
+                )
+            )
+            metadata[label] = (key, False)
+
+    branched = await dosbox_try_actions(
+        trials=trials,
+        duration_seconds=observation_seconds,
+        pid=pid,
+        interval_seconds=interval_seconds,
+        memory_fields=memory_fields,
+        reference=reference,
+        allow_unconfirmed=allow_unconfirmed,
+        max_frames=200,
+        max_samples=500,
+        detect_global_motion=True,
+        stem=stem,
+    )
+    control_trials: list[dict[str, object]] = []
+    summaries: list[dict[str, object]] = []
+    for branch in branched["trials"]:
+        label = branch["label"]
+        action, control = metadata[label]
+        evidence = branch["evidence"]
+        tracks = evidence["visual"]["tracking"]["tracks"]
+        motion = evidence["visual"].get("global_motion")
+        trial_result = {"action": action, "control": control, "tracks": tracks}
+        if motion is not None:
+            trial_result["global_motion"] = motion
+        control_trials.append(trial_result)
+        summaries.append(
+            {
+                "label": label,
+                "action": action,
+                "control": control,
+                "track_count": len(tracks),
+                "changed_pixels": evidence["visual"]["baseline_to_final"][
+                    "changed_pixels"
+                ],
+                "global_translation": (
+                    motion["best_translation"] if motion is not None else None
+                ),
+                "memory_deltas": {
+                    name: item["delta"]
+                    for name, item in evidence["memory"]["fields"].items()
+                },
+                "memory_activity": {
+                    name: {
+                        "minimum": min(values),
+                        "maximum": max(values),
+                        "distinct_values": len(set(values)),
+                        "changed_samples": sum(value != values[0] for value in values),
+                    }
+                    for name in evidence["memory"]["fields"]
+                    if (
+                        values := [
+                            sample[name]
+                            for sample in evidence["memory"].get("samples", [])
+                            if name in sample
+                        ]
+                    )
+                },
+            }
+        )
+    result: dict[str, Any] = {
+        "pid": branched["pid"],
+        "keys": canonical,
+        "repeats": repeats,
+        "baseline_state": branched["baseline_state"],
+        "baseline_restored": branched["baseline_restored"],
+        "ranking": perception.rank_control_responses(control_trials),
+        "trial_summaries": summaries,
+        "epistemic_status": (
+            "ranked repeatable visual response above idle; selected track IDs are "
+            "trial-local evidence and are not semantic player identification"
+        ),
+    }
+    if include_full_evidence:
+        result["full_branch_evidence"] = branched["trials"]
+    return result
 
 
 @mcp.tool(

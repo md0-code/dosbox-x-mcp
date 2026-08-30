@@ -197,6 +197,358 @@ def compare_frames(
     )
 
 
+def _translation_bounds(
+    width: int, height: int, dx: int, dy: int
+) -> tuple[int, int, int, int]:
+    """After-frame bounds whose source coordinate exists in the before frame."""
+    return max(0, dx), max(0, dy), min(width, width + dx), min(height, height + dy)
+
+
+def _translation_score(
+    before: bytes,
+    after: bytes,
+    width: int,
+    height: int,
+    dx: int,
+    dy: int,
+    stride: int,
+) -> tuple[float, int, int]:
+    x0, y0, x1, y1 = _translation_bounds(width, height, dx, dy)
+    matches = samples = 0
+    for y in range(y0, y1, stride):
+        before_row = (y - dy) * width
+        after_row = y * width
+        for x in range(x0, x1, stride):
+            matches += before[before_row + x - dx] == after[after_row + x]
+            samples += 1
+    return (matches / samples if samples else 0.0), matches, samples
+
+
+def detect_translation(
+    before: bytes,
+    after: bytes,
+    width: int,
+    height: int,
+    *,
+    max_dx: int = 16,
+    max_dy: int = 16,
+    sample_stride: int = 2,
+    bridge_radius: int = 0,
+    min_changed_pixels: int = 1,
+) -> dict[str, object]:
+    """Find global frame translation and residual changes without optical flow.
+
+    ``(dx, dy)`` means a pixel in ``before`` appears at that displacement in
+    ``after``. All bounded candidates are sampled; the strongest candidates
+    and their immediate neighbours are then scored at every overlap pixel.
+    """
+    expected = width * height
+    if width <= 0 or height <= 0 or len(before) != expected or len(after) != expected:
+        raise PerceptionError("translation inputs must be equal width*height indexed frames")
+    if not 0 <= max_dx < width or not 0 <= max_dy < height:
+        raise PerceptionError("translation bounds must be non-negative and smaller than the frame")
+    if not 1 <= sample_stride <= 16:
+        raise PerceptionError("sample_stride must be between 1 and 16")
+
+    sampled: list[tuple[float, int, int]] = []
+    for dy in range(-max_dy, max_dy + 1):
+        for dx in range(-max_dx, max_dx + 1):
+            ratio, _, _ = _translation_score(
+                before, after, width, height, dx, dy, sample_stride
+            )
+            sampled.append((ratio, dx, dy))
+    sampled.sort(key=lambda item: (-item[0], abs(item[1]) + abs(item[2]), item[2], item[1]))
+
+    refine: set[tuple[int, int]] = {(0, 0)}
+    for _, dx, dy in sampled[:32]:
+        for near_y in range(max(-max_dy, dy - 1), min(max_dy, dy + 1) + 1):
+            for near_x in range(max(-max_dx, dx - 1), min(max_dx, dx + 1) + 1):
+                refine.add((near_x, near_y))
+    exact: list[dict[str, object]] = []
+    for dx, dy in refine:
+        ratio, matches, overlap = _translation_score(
+            before, after, width, height, dx, dy, 1
+        )
+        exact.append(
+            {
+                "dx": dx,
+                "dy": dy,
+                "match_ratio": ratio,
+                "matching_pixels": matches,
+                "overlap_pixels": overlap,
+                "overlap_fraction": overlap / expected,
+            }
+        )
+    exact.sort(
+        key=lambda item: (
+            -float(item["match_ratio"]),
+            -float(item["overlap_fraction"]),
+            abs(int(item["dx"])) + abs(int(item["dy"])),
+            int(item["dy"]),
+            int(item["dx"]),
+        )
+    )
+    best = exact[0]
+    second = exact[1] if len(exact) > 1 else exact[0]
+    margin = float(best["match_ratio"]) - float(second["match_ratio"])
+    confidence = float(best["match_ratio"]) * min(1.0, max(0.0, margin) / 0.05)
+    dx, dy = int(best["dx"]), int(best["dy"])
+    x0, y0, x1, y1 = _translation_bounds(width, height, dx, dy)
+
+    # Outside the overlap there is no source evidence. Copy after there so the
+    # residual comparison reports only independently changed overlap pixels.
+    compensated = bytearray(after)
+    for y in range(y0, y1):
+        source = (y - dy) * width + x0 - dx
+        target = y * width + x0
+        compensated[target : target + x1 - x0] = before[source : source + x1 - x0]
+    residual = compare_frames(
+        bytes(compensated),
+        after,
+        width,
+        height,
+        bridge_radius=bridge_radius,
+        min_changed_pixels=min_changed_pixels,
+    )
+    return {
+        "best_translation": [dx, dy],
+        "match_ratio": round(float(best["match_ratio"]), 8),
+        "matching_pixels": best["matching_pixels"],
+        "overlap_pixels": best["overlap_pixels"],
+        "overlap_fraction": round(float(best["overlap_fraction"]), 8),
+        "overlap_bbox": [x0, y0, x1 - x0, y1 - y0],
+        "second_best": {
+            "translation": [second["dx"], second["dy"]],
+            "match_ratio": round(float(second["match_ratio"]), 8),
+        },
+        "ambiguity_margin": round(margin, 8),
+        "confidence": round(confidence, 8),
+        "residual": residual.as_dict(),
+        "settings": {
+            "max_dx": max_dx,
+            "max_dy": max_dy,
+            "sample_stride": sample_stride,
+            "refined_candidates": len(exact),
+        },
+        "epistemic_status": (
+            "global indexed-pixel translation evidence; residual regions are "
+            "changes after compensation, not semantic objects"
+        ),
+    }
+
+
+def infer_screen_regions(
+    frames: Sequence[bytes],
+    translations: Sequence[tuple[int, int]],
+    width: int,
+    height: int,
+    *,
+    min_episodes: int = 2,
+    support_ratio: float = 0.8,
+    ambiguity_margin: float = 0.15,
+    min_region_pixels: int = 4,
+    max_regions_per_category: int = 64,
+) -> dict[str, object]:
+    """Accumulate screen-fixed/global-motion evidence across scroll episodes."""
+    expected = width * height
+    if len(frames) < 3 or len(translations) != len(frames) - 1:
+        raise PerceptionError("screen-region inference needs at least 3 frames and one translation per transition")
+    if any(len(frame) != expected for frame in frames):
+        raise PerceptionError("every screen-region frame must be width*height bytes")
+    if min_episodes < 1:
+        raise PerceptionError("min_episodes must be positive")
+    if max_regions_per_category < 1:
+        raise PerceptionError("max_regions_per_category must be positive")
+    if not 0 < support_ratio <= 1 or not 0 <= ambiguity_margin <= 1:
+        raise PerceptionError("support ratios must be between 0 and 1")
+
+    observed = [0] * expected
+    moved = [0] * expected
+    fixed = [0] * expected
+    changed = [0] * expected
+    used_episodes = 0
+    for before, after, (dx, dy) in zip(frames, frames[1:], translations):
+        if dx == 0 and dy == 0:
+            continue
+        used_episodes += 1
+        x0, y0, x1, y1 = _translation_bounds(width, height, dx, dy)
+        for y in range(y0, y1):
+            source_row = (y - dy) * width
+            row = y * width
+            for x in range(x0, x1):
+                at = row + x
+                observed[at] += 1
+                moved[at] += before[source_row + x - dx] == after[at]
+                fixed[at] += before[at] == after[at]
+                changed[at] += before[at] != after[at]
+
+    masks = {
+        "globally_translating": bytearray(expected),
+        "screen_fixed_candidate": bytearray(expected),
+        "frequently_changing_fixed_position_candidate": bytearray(expected),
+        "uncertain": bytearray(expected),
+    }
+    for at, count in enumerate(observed):
+        if count < min_episodes:
+            continue
+        moved_ratio = moved[at] / count
+        fixed_ratio = fixed[at] / count
+        changed_ratio = changed[at] / count
+        if moved_ratio >= support_ratio and moved_ratio - fixed_ratio >= ambiguity_margin:
+            category = "globally_translating"
+        elif fixed_ratio >= support_ratio and fixed_ratio - moved_ratio >= ambiguity_margin:
+            category = "screen_fixed_candidate"
+        elif changed_ratio >= support_ratio and moved_ratio < support_ratio:
+            category = "frequently_changing_fixed_position_candidate"
+        else:
+            category = "uncertain"
+        masks[category][at] = 1
+
+    categories: dict[str, object] = {}
+    blank = bytes(expected)
+    for name, mask in masks.items():
+        comparison = compare_frames(
+            blank,
+            bytes(mask),
+            width,
+            height,
+            min_changed_pixels=min_region_pixels,
+        )
+        regions = sorted(
+            comparison.regions,
+            key=lambda region: (-region.changed_pixels, region.bbox.y, region.bbox.x),
+        )
+        categories[name] = {
+            "pixels": sum(mask),
+            "region_count": len(regions),
+            "regions_truncated": len(regions) > max_regions_per_category,
+            "regions": [
+                region.as_dict() for region in regions[:max_regions_per_category]
+            ],
+        }
+    return {
+        "scroll_episodes": used_episodes,
+        "required_episode_support": min_episodes,
+        "categories": categories,
+        "settings": {
+            "support_ratio": support_ratio,
+            "ambiguity_margin": ambiguity_margin,
+            "min_region_pixels": min_region_pixels,
+            "max_regions_per_category": max_regions_per_category,
+        },
+        "epistemic_status": (
+            "screen-position evidence accumulated across measured translations; "
+            "fixed candidates are not semantically identified as HUD"
+        ),
+    }
+
+
+def rank_control_responses(trials: Sequence[dict[str, object]]) -> list[dict[str, object]]:
+    """Rank repeatable visual-track displacement above idle-control motion."""
+    grouped: dict[str, list[dict[str, object] | None]] = {}
+    controls: list[dict[str, object] | None] = []
+    for trial in trials:
+        action = str(trial.get("action", ""))
+        tracks = trial.get("tracks", [])
+        if not isinstance(tracks, list):
+            raise PerceptionError("control trial tracks must be a list")
+        candidates = []
+        motion = trial.get("global_motion")
+        if isinstance(motion, dict):
+            translation = motion.get("best_translation", [0, 0])
+            if isinstance(translation, list) and len(translation) == 2:
+                dx, dy = float(translation[0]), float(translation[1])
+                confidence = float(motion.get("confidence", 0))
+                candidates.append(
+                    {
+                        "dx": dx,
+                        "dy": dy,
+                        "magnitude": math.hypot(dx, dy),
+                        "confidence": confidence,
+                        "observations": 1.0,
+                        "track_id": 0.0,
+                        "response_kind": "global_translation",
+                        "selection_score": math.hypot(dx, dy) * confidence,
+                    }
+                )
+        else:
+            for track in tracks:
+                if not isinstance(track, dict):
+                    continue
+                dx = float(track.get("dx", 0))
+                dy = float(track.get("dy", 0))
+                confidence = float(track.get("confidence", 0))
+                observations = int(track.get("observations", 0))
+                magnitude = math.hypot(dx, dy)
+                candidates.append(
+                    {
+                        "dx": dx,
+                        "dy": dy,
+                        "magnitude": magnitude,
+                        "confidence": confidence,
+                        "observations": float(observations),
+                        "track_id": float(int(track.get("track_id", 0))),
+                        "response_kind": "changed_region_track",
+                        "selection_score": magnitude * confidence * max(1, observations),
+                    }
+                )
+        selected = max(candidates, key=lambda item: item["selection_score"], default=None)
+        if bool(trial.get("control", False)):
+            controls.append(selected)
+        else:
+            grouped.setdefault(action, []).append(selected)
+
+    idle_magnitudes = [item["magnitude"] for item in controls if item is not None]
+    idle_mean = sum(idle_magnitudes) / len(idle_magnitudes) if idle_magnitudes else 0.0
+    ranked: list[dict[str, object]] = []
+    for action, repeats in grouped.items():
+        present = [item for item in repeats if item is not None]
+        if present:
+            mean_dx = sum(item["dx"] for item in present) / len(present)
+            mean_dy = sum(item["dy"] for item in present) / len(present)
+            mean_magnitude = sum(item["magnitude"] for item in present) / len(present)
+            mean_confidence = sum(item["confidence"] for item in present) / len(present)
+            direction_consistency = (
+                math.hypot(mean_dx, mean_dy) / mean_magnitude if mean_magnitude else 0.0
+            )
+        else:
+            mean_dx = mean_dy = mean_magnitude = mean_confidence = direction_consistency = 0.0
+        support = len(present) / len(repeats) if repeats else 0.0
+        excess = max(0.0, mean_magnitude - idle_mean)
+        score = excess * direction_consistency * mean_confidence * support
+        ranked.append(
+            {
+                "action": action,
+                "repeat_count": len(repeats),
+                "responding_repeats": len(present),
+                "mean_dx": round(mean_dx, 4),
+                "mean_dy": round(mean_dy, 4),
+                "mean_magnitude": round(mean_magnitude, 4),
+                "idle_mean_magnitude": round(idle_mean, 4),
+                "response_excess": round(excess, 4),
+                "direction_consistency": round(direction_consistency, 6),
+                "mean_track_confidence": round(mean_confidence, 6),
+                "score": round(score, 6),
+                "selected_tracks": [
+                    (
+                        {
+                            "track_id": int(item["track_id"]),
+                            "response_kind": item["response_kind"],
+                            "dx": round(item["dx"], 4),
+                            "dy": round(item["dy"], 4),
+                            "confidence": round(item["confidence"], 6),
+                        }
+                        if item is not None
+                        else None
+                    )
+                    for item in repeats
+                ],
+            }
+        )
+    ranked.sort(key=lambda item: (-float(item["score"]), str(item["action"])))
+    return ranked
+
+
 def _iou(left: BoundingBox, right: BoundingBox) -> float:
     x0, y0 = max(left.x, right.x), max(left.y, right.y)
     x1 = min(left.x + left.width, right.x + right.width)

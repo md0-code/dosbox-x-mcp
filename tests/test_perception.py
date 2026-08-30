@@ -10,6 +10,9 @@ from dosbox_mcp.perception import (
     PerceptionError,
     compare_frames,
     correlate_series,
+    detect_translation,
+    infer_screen_regions,
+    rank_control_responses,
     rank_correlations,
     scan_memory_changes,
     track_regions,
@@ -31,6 +34,18 @@ def transitions(frames: list[bytes], width: int, height: int, bridge_radius: int
         compare_frames(before, after, width, height, bridge_radius=bridge_radius)
         for before, after in zip(frames, frames[1:])
     ]
+
+
+def shifted(
+    source: bytes, width: int, height: int, dx: int, dy: int, fill: int = 0
+) -> bytes:
+    result = bytearray([fill]) * (width * height)
+    for y in range(height):
+        for x in range(width):
+            target_x, target_y = x + dx, y + dy
+            if 0 <= target_x < width and 0 <= target_y < height:
+                result[target_y * width + target_x] = source[y * width + x]
+    return bytes(result)
 
 
 def test_identical_frames_have_no_change_or_regions():
@@ -155,6 +170,111 @@ def test_a_large_screen_transition_is_flagged_and_does_not_seed_tracks():
     assert result["track_count"] == 0
 
 
+def test_global_translation_and_local_residual_are_separated():
+    width, height = 32, 20
+    before = bytes((x * 17 + y * 31 + (x * y) % 19) % 251 for y in range(height) for x in range(width))
+    after = bytearray(shifted(before, width, height, 3, -2))
+    for y in range(8, 10):
+        for x in range(14, 17):
+            after[y * width + x] = 255
+    result = detect_translation(
+        before,
+        bytes(after),
+        width,
+        height,
+        max_dx=5,
+        max_dy=4,
+        sample_stride=2,
+    )
+    assert result["best_translation"] == [3, -2]
+    assert result["match_ratio"] > 0.98
+    assert result["confidence"] > 0.5
+    assert result["residual"]["changed_pixels"] == 6
+    assert result["residual"]["region_count"] == 1
+
+
+def test_repeated_flat_frames_report_translation_ambiguity():
+    before = bytes([7]) * (20 * 12)
+    result = detect_translation(before, before, 20, 12, max_dx=3, max_dy=3)
+    assert result["best_translation"] == [0, 0]
+    assert result["ambiguity_margin"] == 0
+    assert result["confidence"] == 0
+
+
+def test_screen_fixed_and_changing_candidates_accumulate_across_scrolls():
+    width, height = 28, 14
+    world = bytes((x * 13 + y * 29 + x * y) % 199 for y in range(height) for x in range(width))
+    frames = []
+    for episode in range(4):
+        pixels = bytearray(shifted(world, width, height, episode, 0))
+        for y in range(2, 4):
+            for x in range(6, 10):
+                pixels[y * width + x] = 250
+        for y in range(9, 11):
+            for x in range(20, 23):
+                pixels[y * width + x] = 210 + episode
+        frames.append(bytes(pixels))
+    result = infer_screen_regions(
+        frames,
+        [(1, 0), (1, 0), (1, 0)],
+        width,
+        height,
+        min_episodes=3,
+        min_region_pixels=2,
+    )
+    categories = result["categories"]
+    assert categories["globally_translating"]["pixels"] > width * height // 2
+    assert any(
+        region["bbox"] == [6, 2, 1, 2]
+        for region in categories["screen_fixed_candidate"]["regions"]
+    )
+    assert categories["uncertain"]["pixels"] >= 6  # flat overlay interior is ambiguous
+    assert any(
+        region["bbox"] == [20, 9, 4, 2]
+        for region in categories["frequently_changing_fixed_position_candidate"]["regions"]
+    )
+
+
+def test_screen_region_reports_cap_components_without_losing_totals():
+    width, height = 12, 4
+    world = bytes((x + y * width) % 200 for y in range(height) for x in range(width))
+    frames = []
+    for episode in range(3):
+        pixels = bytearray(shifted(world, width, height, episode, 0))
+        for x in (2, 6, 10):
+            pixels[width + x] = 250
+        frames.append(bytes(pixels))
+    result = infer_screen_regions(
+        frames,
+        [(1, 0), (1, 0)],
+        width,
+        height,
+        min_episodes=2,
+        min_region_pixels=1,
+        max_regions_per_category=1,
+    )
+    fixed = result["categories"]["screen_fixed_candidate"]
+    assert fixed["region_count"] > 1
+    assert fixed["regions_truncated"] is True
+    assert len(fixed["regions"]) == 1
+
+
+def test_control_response_ranking_subtracts_idle_and_rewards_repeatable_direction():
+    trials = [
+        {"action": "idle", "control": True, "tracks": [{"track_id": 1, "dx": 1, "dy": 0, "confidence": 0.8, "observations": 3}]},
+        {"action": "idle", "control": True, "tracks": [{"track_id": 2, "dx": -1, "dy": 0, "confidence": 0.8, "observations": 3}]},
+        {"action": "right", "tracks": [{"track_id": 4, "dx": 8, "dy": 1, "confidence": 0.9, "observations": 4}]},
+        {"action": "right", "tracks": [{"track_id": 7, "dx": 9, "dy": 0, "confidence": 0.85, "observations": 4}]},
+        {"action": "random", "tracks": [{"track_id": 8, "dx": 5, "dy": 0, "confidence": 0.5, "observations": 2}]},
+        {"action": "random", "tracks": [{"track_id": 9, "dx": -5, "dy": 0, "confidence": 0.5, "observations": 2}]},
+    ]
+    ranked = rank_control_responses(trials)
+    assert ranked[0]["action"] == "right"
+    assert ranked[0]["direction_consistency"] > 0.99
+    assert ranked[0]["response_excess"] > 7
+    assert ranked[1]["direction_consistency"] == 0
+
+
 def snapshots():
     baseline = bytearray(16)
     experiment = bytearray(16)
@@ -272,6 +392,28 @@ def test_saved_frame_and_memory_tools_expose_the_pure_algorithms(tmp_path):
     assert correlated["correlations"][0]["confidence"] == 1
 
 
+def test_compare_frames_optionally_reports_global_motion(tmp_path):
+    width, height = 24, 16
+    before = bytes((x * 11 + y * 23 + x * y) % 251 for y in range(height) for x in range(width))
+    after = shifted(before, width, height, -2, 1)
+    paths = []
+    for name, data in (("before", before), ("after", after)):
+        path = tmp_path / f"{name}.bin"
+        path.write_bytes(data)
+        paths.append(str(path))
+    result = asyncio.run(
+        server.dosbox_compare_frames(
+            paths,
+            width=width,
+            height=height,
+            detect_global_motion=True,
+            max_translation_x=4,
+            max_translation_y=4,
+        )
+    )
+    assert result["transitions"][0]["global_motion"]["best_translation"] == [-2, 1]
+
+
 class _ExperimentProfile:
     screen_width = 12
     screen_height = 8
@@ -360,3 +502,178 @@ def test_act_and_observe_accepts_authentic_held_keys(monkeypatch):
     )
     assert result["action"]["transport"] == "dosbox_x_keyboard_hook_v1"
     assert result["action"]["released"] is True
+
+
+class _BranchSession:
+    pid = 4242
+
+    def __init__(self, directory):
+        self.state_directory = directory
+        self.ds_base = 123
+        self.ram_base = 456
+        self.releases = 0
+        self.locates = 0
+
+    def release_all_keys(self):
+        self.releases += 1
+
+    def locate(self, rescan=False):
+        self.locates += 1
+
+
+def test_try_actions_restores_each_branch_and_the_final_baseline(monkeypatch, tmp_path):
+    live = _BranchSession(tmp_path)
+    state = tmp_path / "100.sav"
+    state.write_bytes(b"state")
+    loads = []
+
+    monkeypatch.setattr(server, "_session", lambda pid: live)
+    monkeypatch.setattr(server.host, "require", lambda capability: None)
+    monkeypatch.setattr(server, "_locate_framebuffer", lambda *args: None)
+    monkeypatch.setattr(
+        server.emulator,
+        "save_branch_state",
+        lambda pid, directory: {"state_file": str(state), "bytes": 5},
+    )
+    monkeypatch.setattr(
+        server.emulator,
+        "load_branch_state",
+        lambda pid, path, settle: loads.append((path, settle)) or {"loaded": True},
+    )
+
+    async def observe(**kwargs):
+        return {"action": kwargs["action"].kind, "stem": kwargs["stem"]}
+
+    monkeypatch.setattr(server, "dosbox_act_and_observe", observe)
+    result = asyncio.run(
+        server.dosbox_try_actions(
+            [
+                server.BranchTrial(label="idle", action=server.ExperimentAction(kind="idle")),
+                server.BranchTrial(
+                    label="right",
+                    action=server.ExperimentAction(
+                        kind="hold_keys", keys=["right"], duration_seconds=0.1
+                    ),
+                ),
+            ],
+            duration_seconds=0.2,
+            stem="branches/trial",
+        )
+    )
+    assert [entry["label"] for entry in result["trials"]] == ["idle", "right"]
+    assert result["restore_count"] == 3
+    assert len(loads) == 3
+    assert result["baseline_restored"] is True
+    assert live.ds_base == 0 or live.locates == 3
+
+
+def test_try_actions_restores_after_a_failed_trial(monkeypatch, tmp_path):
+    live = _BranchSession(tmp_path)
+    state = tmp_path / "100.sav"
+    state.write_bytes(b"state")
+    loads = []
+    monkeypatch.setattr(server, "_session", lambda pid: live)
+    monkeypatch.setattr(server.host, "require", lambda capability: None)
+    monkeypatch.setattr(server, "_locate_framebuffer", lambda *args: None)
+    monkeypatch.setattr(
+        server.emulator,
+        "save_branch_state",
+        lambda pid, directory: {"state_file": str(state), "bytes": 5},
+    )
+    monkeypatch.setattr(
+        server.emulator,
+        "load_branch_state",
+        lambda *args: loads.append(args) or {"loaded": True},
+    )
+
+    async def fail(**kwargs):
+        raise RuntimeError("trial failed")
+
+    monkeypatch.setattr(server, "dosbox_act_and_observe", fail)
+    with pytest.raises(RuntimeError, match="trial failed"):
+        asyncio.run(
+            server.dosbox_try_actions(
+                [server.BranchTrial(label="bad", action=server.ExperimentAction())]
+            )
+        )
+    assert len(loads) == 2
+
+
+def test_probe_controls_builds_idle_repeats_and_ranks_visual_response(monkeypatch):
+    async def branched(**kwargs):
+        branches = []
+        for trial in kwargs["trials"]:
+            moving = trial.label.startswith("right")
+            tracks = (
+                [{"track_id": 1, "dx": 8, "dy": 0, "confidence": 0.9, "observations": 4}]
+                if moving
+                else [{"track_id": 1, "dx": 1, "dy": 0, "confidence": 0.8, "observations": 3}]
+            )
+            branches.append(
+                {
+                    "label": trial.label,
+                    "evidence": {
+                        "visual": {
+                            "tracking": {"tracks": tracks},
+                            "baseline_to_final": {"changed_pixels": 4},
+                        },
+                        "memory": {"fields": {}},
+                    },
+                }
+            )
+        return {
+            "pid": 4242,
+            "baseline_state": {"state_file": "100.sav"},
+            "baseline_restored": True,
+            "trials": branches,
+        }
+
+    monkeypatch.setattr(server, "dosbox_try_actions", branched)
+    result = asyncio.run(
+        server.dosbox_probe_controls(
+            ["right"], hold_seconds=0.1, observation_seconds=0.2, repeats=2
+        )
+    )
+    assert [item["label"] for item in result["trial_summaries"]] == [
+        "idle_r1",
+        "idle_r2",
+        "right_r1",
+        "right_r2",
+    ]
+    assert result["ranking"][0]["action"] == "right"
+    assert result["baseline_restored"] is True
+
+
+def test_rank_control_responses_prefers_global_motion_when_available():
+    trials = [
+        {
+            "action": "idle",
+            "control": True,
+            "tracks": [{"track_id": 8, "dx": 100, "dy": 0, "confidence": 1}],
+            "global_motion": {"best_translation": [1, 0], "confidence": 0.9},
+        },
+        {
+            "action": "right",
+            "control": False,
+            "tracks": [],
+            "global_motion": {"best_translation": [-8, 0], "confidence": 0.9},
+        },
+        {
+            "action": "right",
+            "control": False,
+            "tracks": [],
+            "global_motion": {"best_translation": [-7, 0], "confidence": 0.8},
+        },
+    ]
+    ranked = rank_control_responses(trials)
+    assert ranked[0]["action"] == "right"
+    assert ranked[0]["response_excess"] == 6.5
+    assert all(
+        item["response_kind"] == "global_translation"
+        for item in ranked[0]["selected_tracks"]
+    )
+
+
+def test_probe_controls_rejects_unknown_raw_key():
+    with pytest.raises(server.SessionError, match="unknown raw key"):
+        asyncio.run(server.dosbox_probe_controls(["not-a-key"]))

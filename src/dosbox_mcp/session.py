@@ -20,6 +20,7 @@ import struct
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from . import guest as dosguest
 from .platform import (
@@ -150,6 +151,7 @@ class Session:
     attached_at: float = field(default_factory=time.time)
     display: object | None = None
     config: object | None = None
+    state_directory: Path | None = None
     traces: dict = field(default_factory=dict)
     _process: Process | None = None
     _framebuffer: Framebuffer | None = None

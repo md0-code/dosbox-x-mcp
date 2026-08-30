@@ -19,7 +19,7 @@ without changing a byte on disk.
 | **Address any segment** | Another program in a launcher chain, a TSR, an overlay, the interrupt vector table, EMS pages. Read, patch, dump, search. |
 | **Drive it** | Menu keys through the BIOS ring; authentic simultaneous make/break holds through the companion DOSBox-X hook; clicks through the game's post-INT-33h mouse words. None goes near the host's input queue. |
 | **See it** | Read the framebuffer straight out of the emulator's video memory: exact indices, no window, no scaling, no cost to the guest — confirmed against a reference frame. Or photograph the window when you must. |
-| **Experiment** | Compare exact frames, extract and track neutral changed regions, apply one bounded action while observing visual and memory consequences, scan unknown memory, and correlate numeric evidence. |
+| **Experiment** | Compare exact frames, compensate camera motion, extract and track neutral changed regions, branch actions from one isolated save state, probe controls, scan unknown memory, and retain evidence separately from profiles. |
 | **Measure it** | Block on a memory condition, or sample a watch list at up to 200 Hz into a TSV — every column from one snapshot, so they cannot drift apart. Watch video memory for every distinct frame and when it appeared. |
 | **Record it** | The emulator's own OPL, MIDI and WAVE capture, fired without focus and without the host mapper. |
 | **Instrument it** | Redirect a live `CALL` through a code cave that records registers and memory at every hit, then read it while the guest runs at full speed. Nothing on disk changes. |
@@ -125,8 +125,11 @@ there is never any doubt where a file went.
 | `dosbox_watch_frames` | every distinct frame in a stretch of time, with timings |
 | `dosbox_compare_frames` | exact differences, changed regions and neutral tracks across saved indexed frames |
 | `dosbox_act_and_observe` | one bounded action plus its visual and memory consequences |
+| `dosbox_try_actions` | restore one isolated save-state baseline before each labelled trial |
+| `dosbox_probe_controls` | rank repeated authentic held-key responses above idle motion |
 | `dosbox_scan_changes` | rank 1-, 2- or 4-byte fields across experiment/control snapshots |
 | `dosbox_correlate_memory` | correlate a visual numeric series with candidate memory series |
+| `dosbox_evidence_notebook` | persist observed, inferred and confirmed claims outside profiles |
 | `dosbox_emulator_command` | fire one of DOSBox-X's own menu items |
 | `dosbox_record` | record OPL, MIDI or WAVE output to a file |
 | `dosbox_find_cave` | find zero-filled runs big enough for a trace |
@@ -218,6 +221,17 @@ dosbox_compare_frames(
 → track 3: dx +7, dy 0, age 2, confidence 0.91
 ```
 
+For scrolling scenes, enable bounded global translation and screen-position
+evidence. The result includes the best `(dx, dy)`, match and ambiguity scores,
+translation-compensated residual regions, and neutral region categories:
+
+```text
+dosbox_compare_frames(
+  frames=["walk_000.bin", "walk_001.bin", "walk_002.bin"],
+  detect_global_motion=true, infer_screen_layout=true,
+  max_translation_x=16, max_translation_y=16)
+```
+
 Run an idle control or a bounded action and collect both evidence streams in one
 round trip:
 
@@ -240,6 +254,25 @@ read IRQ1, port `0x60`, or their own held-key table may ignore it; the tool says
 so in every result. Use `kind="hold_keys"` with a
 [companion-enabled DOSBox-X build](docs/raw-keyboard.md) for those games.
 
+Run independent trials from one baseline by launching with a dedicated state
+directory. The server reserves slot 100 there and restores it before every
+trial and once more before returning, without touching personal save slots:
+
+```text
+dosbox_launch(config="game.conf", profile="none",
+  state_directory="experiments/state")
+dosbox_try_actions(
+  trials=[
+    {"label":"idle","action":{"kind":"idle"}},
+    {"label":"right","action":{"kind":"hold_keys","keys":["right"],
+      "duration_seconds":0.35}}
+  ], duration_seconds=0.75, stem="experiments/branch")
+```
+
+`dosbox_probe_controls` automates repeated idle and held-key branches and ranks
+repeatable visual responses. Rankings remain neutral evidence: they do not name
+a track as the player.
+
 Compare independent branches or repeated trials with an idle control and an
 opposite action:
 
@@ -260,6 +293,20 @@ dosbox_correlate_memory(
   memory_series={"DS:19A4":[1840,1920,2016,2112]})
 → raw/difference correlation, direction, and simple fixed-scale evidence
 ```
+
+Store conclusions in a separate evidence notebook instead of turning a
+hypothesis into a profile fact:
+
+```text
+dosbox_evidence_notebook(
+  operation="upsert", path="experiments/evidence.json",
+  subject="memory:DS:19A4", status="inferred", label="horizontal state",
+  confidence=0.92,
+  evidence=["increased in repeated RIGHT branches", "stable in idle branches"])
+```
+
+Notebook revisions retain their history and use the explicit statuses
+`observed`, `inferred`, and `confirmed`.
 
 Frame processing is dependency-free and practical for 320×200 indexed modes.
 Large whole-screen transitions reset associations instead of creating hundreds

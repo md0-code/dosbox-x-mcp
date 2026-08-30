@@ -94,6 +94,7 @@ def build_mosaic(
     width: int,
     height: int,
     max_mosaic_pixels: int = 64 * 1024 * 1024,
+    placement_methods: Sequence[str] | None = None,
 ) -> Mosaic:
     """Stitch frames using camera displacement derived from visual translation.
 
@@ -109,6 +110,11 @@ def build_mosaic(
         raise WorldError("a world mosaic needs at least two frames")
     if len(translations) != len(frames) - 1:
         raise WorldError("a world mosaic needs one translation per frame transition")
+    if placement_methods is not None and len(placement_methods) != len(frames):
+        raise WorldError("mosaic placement_methods needs one provenance value per frame")
+    allowed_methods = {"direct", "consensus_corrected", "unresolved"}
+    if placement_methods is not None and any(method not in allowed_methods for method in placement_methods):
+        raise WorldError("mosaic placement methods must be direct, consensus_corrected, or unresolved")
     expected = width * height
     if any(len(frame) != expected for frame in frames):
         raise WorldError("every mosaic frame must contain width*height indexed pixels")
@@ -146,6 +152,7 @@ def build_mosaic(
                 "frame": frame_index,
                 "camera_origin": [origin_x, origin_y],
                 "mosaic_offset": [placed_x, placed_y],
+                "placement_method": placement_methods[frame_index] if placement_methods is not None else "direct",
             }
         )
         for y in range(height):

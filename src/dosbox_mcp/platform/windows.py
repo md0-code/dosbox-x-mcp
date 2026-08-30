@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.wintypes as wt
+from pathlib import Path
 from typing import Iterator
 
 from .base import BaseProcess, Capabilities, ProcessError, Window
@@ -84,6 +85,8 @@ kernel32.WriteProcessMemory.argtypes = [
 kernel32.WriteProcessMemory.restype = wt.BOOL
 kernel32.GetExitCodeProcess.argtypes = [wt.HANDLE, ctypes.POINTER(wt.DWORD)]
 kernel32.GetExitCodeProcess.restype = wt.BOOL
+kernel32.QueryFullProcessImageNameW.argtypes = [wt.HANDLE, wt.DWORD, wt.LPWSTR, ctypes.POINTER(wt.DWORD)]
+kernel32.QueryFullProcessImageNameW.restype = wt.BOOL
 
 
 class Process(BaseProcess):
@@ -114,6 +117,13 @@ class Process(BaseProcess):
         if not kernel32.GetExitCodeProcess(self.handle, ctypes.byref(code)):
             return False
         return code.value == STILL_ACTIVE
+
+    def executable_path(self) -> Path:
+        size = wt.DWORD(32768)
+        buffer = ctypes.create_unicode_buffer(size.value)
+        if not kernel32.QueryFullProcessImageNameW(self.handle, 0, buffer, ctypes.byref(size)):
+            raise ProcessError(f"QueryFullProcessImageNameW({self.pid}) failed (error {ctypes.get_last_error()})")
+        return Path(buffer.value)
 
     def read(self, address: int, size: int) -> bytes | None:
         buffer = ctypes.create_string_buffer(size)

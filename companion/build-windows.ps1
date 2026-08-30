@@ -12,14 +12,18 @@ if ($LASTEXITCODE -ne 0 -or $tag -ne "dosbox-x-v2026.07.02") {
     throw "Source must be the exact DOSBox-X tag dosbox-x-v2026.07.02."
 }
 
-$patch = Join-Path $PSScriptRoot "dosbox-x-mcp-keyboard-v1.patch"
-& git -C $sourcePath apply --check $patch
-if ($LASTEXITCODE -eq 0) {
-    & git -C $sourcePath apply $patch
-} else {
-    & git -C $sourcePath apply --reverse --check $patch
-    if ($LASTEXITCODE -ne 0) {
-        throw "The companion patch neither applies cleanly nor is already applied."
+$include = Join-Path $PSScriptRoot "dosbox-x-mcp-v2.inc"
+Copy-Item -LiteralPath $include -Destination (Join-Path $sourcePath "src\gui\dosbox-x-mcp-v2.inc") -Force
+foreach ($patchName in @("dosbox-x-mcp-keyboard-v1.patch", "dosbox-x-mcp-write-watch.patch", "dosbox-x-mcp-irq-ack.patch", "dosbox-x-mcp-video-frame.patch", "dosbox-x-savestate-flag-loop.patch")) {
+    $patch = Join-Path $PSScriptRoot $patchName
+    & git -C $sourcePath apply --check $patch
+    if ($LASTEXITCODE -eq 0) {
+        & git -C $sourcePath apply $patch
+    } else {
+        & git -C $sourcePath apply --reverse --check $patch
+        if ($LASTEXITCODE -ne 0) {
+            throw "Companion patch $patchName neither applies cleanly nor is already applied."
+        }
     }
 }
 

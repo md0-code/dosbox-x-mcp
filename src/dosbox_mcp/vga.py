@@ -429,3 +429,158 @@ def palette_bytes(entries) -> bytes:
     for red, green, blue in entries:
         out += bytes((red >> 2, green >> 2, blue >> 2))
     return bytes(out)
+
+
+# ── exact offline decoders for additional VGA layouts ────────────────────
+
+
+def decode_mode_x(planes: tuple[bytes, bytes, bytes, bytes], width: int, height: int, *, start_address: int = 0, pitch: int | None = None) -> bytes:
+    """Decode four unchained 256-colour planes into indexed pixels."""
+    if width <= 0 or height <= 0 or width % 4:
+        raise VgaError("Mode X width must be positive and divisible by four")
+    plane_pitch = pitch if pitch is not None else width // 4
+    if plane_pitch < width // 4 or start_address < 0:
+        raise VgaError("invalid Mode X pitch or start address")
+    needed = start_address + plane_pitch * height
+    if len(planes) != 4 or any(len(plane) < needed for plane in planes):
+        raise VgaError("Mode X plane data is shorter than the requested page")
+    output = bytearray(width * height)
+    for y in range(height):
+        row = start_address + y * plane_pitch
+        for x in range(width):
+            output[y * width + x] = planes[x & 3][row + (x >> 2)]
+    return bytes(output)
+
+
+def decode_planar_4bpp(planes: tuple[bytes, bytes, bytes, bytes], width: int, height: int, *, start_address: int = 0, pitch: int | None = None) -> bytes:
+    """Decode EGA/VGA four-plane 16-colour storage into palette indices."""
+    if width <= 0 or height <= 0 or width % 8:
+        raise VgaError("planar width must be positive and divisible by eight")
+    row_bytes = pitch if pitch is not None else width // 8
+    if row_bytes < width // 8 or start_address < 0:
+        raise VgaError("invalid planar pitch or start address")
+    needed = start_address + row_bytes * height
+    if len(planes) != 4 or any(len(plane) < needed for plane in planes):
+        raise VgaError("planar data is shorter than the requested page")
+    output = bytearray(width * height)
+    for y in range(height):
+        row = start_address + y * row_bytes
+        for x in range(width):
+            mask = 0x80 >> (x & 7)
+            source = row + (x >> 3)
+            output[y * width + x] = sum(((planes[plane][source] & mask) != 0) << plane for plane in range(4))
+    return bytes(output)
+
+
+def decode_text_cells(raw: bytes, columns: int, rows: int, *, start_address: int = 0, pitch: int | None = None) -> list[list[dict[str, int]]]:
+    """Decode VGA text memory while preserving character and attribute bytes."""
+    if columns <= 0 or rows <= 0 or start_address < 0:
+        raise VgaError("invalid text dimensions or start address")
+    row_bytes = pitch if pitch is not None else columns * 2
+    if row_bytes < columns * 2 or len(raw) < start_address + row_bytes * rows:
+        raise VgaError("text memory is shorter than the requested page")
+    result: list[list[dict[str, int]]] = []
+    for y in range(rows):
+        row: list[dict[str, int]] = []
+        base = start_address + y * row_bytes
+        for x in range(columns):
+            character, attribute = raw[base + x * 2 : base + x * 2 + 2]
+            row.append({"character": character, "attribute": attribute, "foreground": attribute & 0x0F, "background": (attribute >> 4) & 0x07, "blink": (attribute >> 7) & 1})
+        result.append(row)
+    return result
+
+
+def decode_vesa_linear(raw: bytes, width: int, height: int, *, pitch: int, bytes_per_pixel: int, start_address: int = 0) -> bytes:
+    """Extract exact packed VESA pixels, removing row padding only."""
+    if width <= 0 or height <= 0 or bytes_per_pixel not in (1, 2, 3, 4):
+        raise VgaError("invalid VESA dimensions or pixel width")
+    row_bytes = width * bytes_per_pixel
+    if pitch < row_bytes or start_address < 0 or len(raw) < start_address + pitch * height:
+        raise VgaError("VESA storage is shorter than the requested page")
+    return b"".join(raw[start_address + y * pitch : start_address + y * pitch + row_bytes] for y in range(height))
+
+
+def apply_dac_timeline(initial: bytes, writes: list[dict[str, int]]) -> list[dict[str, object]]:
+    """Replay timestamped six-bit DAC component writes without losing history."""
+    if len(initial) != 768:
+        raise VgaError("a VGA DAC contains exactly 768 component bytes")
+    palette = bytearray(initial)
+    result: list[dict[str, object]] = []
+    previous_counter = -1
+    for write in writes:
+        counter = int(write["counter"])
+        index = int(write["index"])
+        component = int(write["component"])
+        value = int(write["value"])
+        if counter < previous_counter or not 0 <= index < 256 or not 0 <= component < 3 or not 0 <= value < 64:
+            raise VgaError("invalid or out-of-order DAC timeline write")
+        palette[index * 3 + component] = value
+        result.append({"counter": counter, "index": index, "component": component, "value": value, "palette": bytes(palette)})
+        previous_counter = counter
+    return result
+
+
+def decode_companion_snapshot(snapshot: dict[str, object]) -> dict[str, object]:
+    """Decode one acknowledged companion snapshot without discarding raw data."""
+    try:
+        raw = bytes.fromhex(str(snapshot["raw_hex"]))
+        palette = bytes.fromhex(str(snapshot["dac_hex"]))
+        layout = str(snapshot["layout"])
+        width = int(snapshot["width"])
+        height = int(snapshot["height"])
+        pitch = int(snapshot["pitch"])
+        plane_pitch = int(snapshot.get("plane_pitch", pitch))
+        start = int(snapshot["start_address"])
+        mode_id = int(snapshot["mode_id"])
+        bpp = int(snapshot["bpp"])
+    except (KeyError, TypeError, ValueError) as failure:
+        raise VgaError(f"malformed companion snapshot: {failure}") from None
+    if len(palette) != 768:
+        raise VgaError("companion snapshot has an incomplete VGA DAC")
+    if layout == "dosbox_chain4_sparse":
+        flat = dechain(raw)
+        needed = start + width * height
+        if width <= 0 or height <= 0 or len(flat) < needed:
+            raise VgaError("chain-4 snapshot is shorter than the presented page")
+        decoded = flat[start:needed]
+        kind = "indexed"
+    elif layout == "plane_interleaved":
+        planes = tuple(raw[index::4] for index in range(4))
+        if mode_id == 3:
+            decoded = decode_mode_x(planes, width, height, start_address=start, pitch=plane_pitch)
+        elif mode_id in (2, 4, 21):
+            decoded = decode_planar_4bpp(planes, width, height, start_address=start, pitch=plane_pitch)
+        else:
+            raise VgaError(f"unsupported planar companion mode {mode_id}")
+        kind = "indexed"
+    elif layout == "linear_packed":
+        bytes_per_pixel = 1 if bpp == 8 else 2 if bpp in (15, 16) else 3 if bpp == 24 else 4 if bpp == 32 else 0
+        if not bytes_per_pixel:
+            raise VgaError(f"unsupported packed pixel width {bpp}")
+        decoded = decode_vesa_linear(raw, width, height, pitch=pitch, bytes_per_pixel=bytes_per_pixel, start_address=start)
+        kind = "indexed" if bpp == 8 else "packed"
+    elif layout == "text_plane_interleaved":
+        columns = int(snapshot.get("text_columns", 0))
+        rows = int(snapshot.get("text_rows", 0))
+        font_height = int(snapshot.get("font_height", 0))
+        cell_stride = int(snapshot.get("text_cell_stride", 8))
+        if columns <= 0 or rows <= 0 or plane_pitch < columns or cell_stride < 2:
+            raise VgaError("text snapshot has invalid cell dimensions or plane pitch")
+        needed = (start + plane_pitch * rows) * cell_stride
+        if len(raw) < needed:
+            raise VgaError("text snapshot is shorter than the presented cell page")
+        cell_bytes = bytearray(columns * rows * 2)
+        for y in range(rows):
+            target = y * columns * 2
+            for x in range(columns):
+                source = (start + y * plane_pitch + x) * cell_stride
+                cell_bytes[target + x * 2] = raw[source]
+                cell_bytes[target + x * 2 + 1] = raw[source + 1]
+        decoded = decode_text_cells(bytes(cell_bytes), columns, rows)
+        kind = "text"
+    else:
+        raise VgaError(f"unsupported companion video layout {layout!r}")
+    result = {"kind": kind, "pixels": decoded, "palette": palette, "raw": raw, "width": width, "height": height, "bpp": bpp, "layout": layout}
+    if layout == "text_plane_interleaved":
+        result.update({"columns": columns, "rows": rows, "font_height": font_height, "char9dot": bool(snapshot.get("char9dot", False)), "text_cell_stride": cell_stride, "font_plane": raw[2::4], "font_plane_source": "raw VGA plane 2 at the acknowledged frame"})
+    return result

@@ -1,0 +1,13 @@
+diff --git a/src/hardware/vga_draw.cpp b/src/hardware/vga_draw.cpp
+index 8c55876..c9af16d 100644
+--- a/src/hardware/vga_draw.cpp
++++ b/src/hardware/vga_draw.cpp
+@@ -5964,5 +5964,8 @@ Bitu DEBUG_EnableDebugger(void);
+ #endif
+ 
++extern void DOSBoxMCPV2VideoFrame(void);
++
+ static void VGA_VerticalTimer(Bitu /*val*/) {
++	DOSBoxMCPV2VideoFrame();
+ 	double current_time = PIC_GetCurrentEventTime();
+ 

@@ -23,6 +23,20 @@ def test_mosaic_places_camera_motion_in_world_coordinates():
     assert mosaic.coverage == bytes((1, 2, 2, 2, 1, 1, 2, 2, 2, 1))
     assert mosaic.conflict_observations == 0
     assert mosaic.placements[1]["camera_origin"] == [1, 0]
+    assert mosaic.placements[1]["placement_method"] == "direct"
+
+
+def test_mosaic_records_consensus_and_unresolved_placement_provenance():
+    mosaic = build_mosaic(
+        [bytes((1, 2)), bytes((2, 3)), bytes((2, 3))],
+        [(-1, 0), (0, 0)],
+        2,
+        1,
+        placement_methods=["direct", "consensus_corrected", "unresolved"],
+    )
+    assert [item["placement_method"] for item in mosaic.placements] == [
+        "direct", "consensus_corrected", "unresolved"
+    ]
 
 
 def test_mosaic_preserves_first_observation_and_reports_conflicts():

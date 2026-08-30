@@ -47,7 +47,7 @@ def test_notebook_rejects_empty_evidence_and_invalid_documents(tmp_path):
 def test_remove_is_explicit_and_preserves_other_entries(tmp_path):
     path = tmp_path / "evidence.json"
     evidence.upsert(path, "a", "observed", ["A"])
-    evidence.upsert(path, "b", "confirmed", ["B"])
+    evidence.upsert(path, "b", "confirmed", ["B"], artifact_refs=["bundle-id:evidence"])
     assert evidence.remove(path, "a") is True
     assert evidence.remove(path, "missing") is False
     assert [entry["subject"] for entry in evidence.entries(path)] == ["b"]

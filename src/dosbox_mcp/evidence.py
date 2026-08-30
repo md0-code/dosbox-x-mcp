@@ -55,6 +55,7 @@ def upsert(
     evidence: list[str],
     label: str | None = None,
     confidence: float | None = None,
+    artifact_refs: list[str] | None = None,
     now: str | None = None,
 ) -> dict[str, object]:
     subject = subject.strip()
@@ -74,6 +75,11 @@ def upsert(
     previous = entries.get(subject, {})
     previous_evidence = previous.get("evidence", []) if isinstance(previous, dict) else []
     combined = list(dict.fromkeys([*previous_evidence, *added]))
+    added_refs = [item.strip() for item in (artifact_refs or []) if item.strip()]
+    previous_refs = previous.get("artifact_refs", []) if isinstance(previous, dict) else []
+    combined_refs = list(dict.fromkeys([*previous_refs, *added_refs]))
+    if status == "confirmed" and not combined_refs:
+        raise EvidenceError("confirmed evidence must reference at least one immutable bundle artifact")
     timestamp = now or datetime.now(timezone.utc).isoformat()
     history = list(previous.get("history", [])) if isinstance(previous, dict) else []
     history.append(
@@ -83,6 +89,7 @@ def upsert(
             "label": label,
             "confidence": confidence,
             "evidence_added": added,
+            "artifact_refs_added": added_refs,
         }
     )
     entry = {
@@ -91,6 +98,7 @@ def upsert(
         "status": status,
         "confidence": confidence,
         "evidence": combined,
+        "artifact_refs": combined_refs,
         "created_at": previous.get("created_at", timestamp) if isinstance(previous, dict) else timestamp,
         "updated_at": timestamp,
         "history": history,

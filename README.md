@@ -112,6 +112,8 @@ there is never any doubt where a file went.
 | `dosbox_send_keys` | type into the BIOS keyboard ring |
 | `dosbox_key_state` | set authentic make/break state with automatic lease release |
 | `dosbox_hold_keys` | hold simultaneous authentic keys for a bounded duration |
+| `dosbox_run_timeline` | schedule ordered input, capture, memory and trace events against emulator counters |
+| `dosbox_companion_status` | report protocol-v2 capabilities, session identity and guest-time counters |
 | `dosbox_click` | click through the game's own mouse words |
 | `dosbox_hold_buttons` | hold buttons down, optionally until a memory test passes |
 | `dosbox_read_memory` | read the data segment, or any segment |
@@ -127,6 +129,9 @@ there is never any doubt where a file went.
 | `dosbox_act_and_observe` | one bounded action plus its visual and memory consequences |
 | `dosbox_try_actions` | restore one isolated save-state baseline before each labelled trial |
 | `dosbox_probe_controls` | rank repeated authentic held-key responses above idle motion |
+| `dosbox_qualify_controls` | rank camera, local-visual, memory and transition evidence behind automatic quality gates |
+| `dosbox_evaluate_experiment` | evaluate strict or exploratory experiment-quality gates without running a trial |
+| `dosbox_estimate_camera_path` | build a multi-frame consensus camera path with ambiguity, outliers and exact loop closure |
 | `dosbox_build_world_mosaic` | stitch indexed frames in measured camera coordinates, retaining conflicts |
 | `dosbox_infer_movement_constraints` | find repeated requested-direction stalls without calling them collisions |
 | `dosbox_scan_changes` | rank 1-, 2- or 4-byte fields across experiment/control snapshots |
@@ -138,6 +143,12 @@ there is never any doubt where a file went.
 | `dosbox_install_trace` | redirect a live `CALL` through a recording cave |
 | `dosbox_read_trace` | read what a trace has recorded |
 | `dosbox_remove_trace` | restore the call site and blank the cave |
+| `dosbox_observe_writes` | attribute bounded guest-memory writes to exact runtime CS:IP writers |
+| `dosbox_capture_video_snapshot` | capture acknowledged raw VGA planes/pages and same-frame DAC state |
+| `dosbox_decode_video_snapshot` | exactly decode a stored Mode X, planar EGA/VGA, text or packed VESA snapshot |
+| `dosbox_create_experiment_bundle` | finalise raw and derived evidence into an immutable, hashed bundle |
+| `dosbox_verify_experiment_bundle` | verify every bundle artifact and manifest hash offline |
+| `dosbox_reproduce_experiment_bundle` | reproduce stored comparisons, camera paths, mosaics, tiles and constraints offline |
 
 Anywhere an offset is accepted, a profile symbol name works too — `treasury`
 rather than `0x634A`.
@@ -198,6 +209,12 @@ start address puts it, which is a four-byte boundary and nothing coarser. The
 one measured live sat at offset 16.
 
 ## Perception and controlled experiments
+
+For the complete acknowledged workflow—from an atomic guest-time timeline to a
+verified, reproducible bundle—see
+[Controlled DOS experiments](docs/CONTROLLED_EXPERIMENTS.md). The exercised
+platform, video-mode and SecondStrike acceptance matrix is recorded in
+[Validation](docs/VALIDATION.md).
 
 Perception tools report measurements, not game meanings. A region is an exact
 connected set of changed pixels; a track is a deterministic association between
@@ -309,6 +326,12 @@ dosbox_evidence_notebook(
 
 Notebook revisions retain their history and use the explicit statuses
 `observed`, `inferred`, and `confirmed`.
+
+For auditable work, finalise inputs, timelines, observations, derivations and
+gate records into an experiment bundle. Bundles are immutable, hash every
+artifact, can be verified or reproduced offline, and allow confirmed notebook
+entries to cite exact artifact IDs. See
+[Experiment bundles](docs/EXPERIMENT_BUNDLES.md).
 
 After camera translation is understood, stitch frames into an indexed world
 mosaic. Supply measured translations or let the tool run the same bounded

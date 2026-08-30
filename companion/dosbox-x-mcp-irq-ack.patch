@@ -1,0 +1,24 @@
+diff --git a/src/hardware/keyboard.cpp b/src/hardware/keyboard.cpp
+index 59648ba..5dd5f2f 100644
+--- a/src/hardware/keyboard.cpp
++++ b/src/hardware/keyboard.cpp
+@@ -54,6 +54,7 @@ void KEYBOARD_AddBuffer(uint16_t data);
+ static void KEYBOARD_Add8042Response(uint8_t data);
+ void KEYBOARD_SetLEDs(uint8_t bits);
+ void KeyboardLayoutDetect(void);
++void DOSBoxMCPKeyboardIRQ1Observed(void);
+ 
+ extern bool user_cursor_locked;
+ extern unsigned int host_keyboard_layout;
+@@ -270,7 +271,10 @@ static void KEYBOARD_SetPort60(uint16_t val) {
+     else {
+         if (keyb.cb_irq1) {
+             if (machine == MCH_PCJR) CPU_Raise_NMI(); /* NTS: PCjr apparently hooked the keyboard to NMI */
+-            else PIC_ActivateIRQ(1);
++            else {
++                PIC_ActivateIRQ(1);
++                DOSBoxMCPKeyboardIRQ1Observed();
++            }
+         }
+     }
+ }

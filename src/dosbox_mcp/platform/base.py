@@ -15,6 +15,7 @@ that are genuinely system-specific.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Iterator
 
 #: Read in chunks rather than whole regions: an emulator with a large video
@@ -95,6 +96,9 @@ class BaseProcess:
         raise NotImplementedError
 
     def close(self) -> None:  # pragma: no cover
+        raise NotImplementedError
+
+    def executable_path(self) -> Path:  # pragma: no cover
         raise NotImplementedError
 
     # ── shared ─────────────────────────────────────────────────────────────

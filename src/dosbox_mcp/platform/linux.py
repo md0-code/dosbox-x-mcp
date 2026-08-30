@@ -38,6 +38,7 @@ import ctypes.util
 import os
 import re
 import signal
+from pathlib import Path
 from typing import Iterator
 
 from .base import BaseProcess, Capabilities, ProcessError, Window
@@ -175,6 +176,12 @@ class Process(BaseProcess):
         except PermissionError:
             return True
         return os.path.isdir(f"/proc/{self.pid}")
+
+    def executable_path(self) -> Path:
+        try:
+            return Path(f"/proc/{self.pid}/exe").resolve(strict=True)
+        except OSError as failure:
+            raise ProcessError(f"cannot resolve executable for process {self.pid}: {failure}") from None
 
     # ── memory ─────────────────────────────────────────────────────────────
 

@@ -1,0 +1,46 @@
+diff --git a/include/mem.h b/include/mem.h
+index ad979b1..b9e76e9 100644
+--- a/include/mem.h
++++ b/include/mem.h
+@@ -48,6 +48,9 @@ typedef uint64_t              PhysPt64;           /* guest physical memory point
+ 
+ typedef int32_t               MemHandle;
+ 
++extern bool dosbox_mcp_write_watch_enabled;
++void DOSBoxMCPObserveHostWrite(HostPt off, uint32_t value, unsigned int width);
++
+ extern HostPt                 MemBase;
+ extern size_t                 MemSize;
+ 
+@@ -87,6 +90,7 @@ static INLINE uint8_t host_readb(ConstHostPt const off) {
+ }
+ 
+ static INLINE void host_writeb(HostPt const off,const uint8_t val) {
++    if (dosbox_mcp_write_watch_enabled) DOSBoxMCPObserveHostWrite(off, val, 1);
+     *off = val;
+ }
+ 
+@@ -101,9 +105,11 @@ static INLINE uint32_t host_readd(ConstHostPt off) {
+     return __builtin_bswap32(*(uint32_t *)off);
+ }
+ static INLINE void host_writew(HostPt const off, const uint16_t val) {
++    if (dosbox_mcp_write_watch_enabled) DOSBoxMCPObserveHostWrite(off, val, 2);
+     *(uint16_t *)off = __builtin_bswap16(val);
+ }
+ static INLINE void host_writed(HostPt const off, const uint32_t val) {
++    if (dosbox_mcp_write_watch_enabled) DOSBoxMCPObserveHostWrite(off, val, 4);
+     *(uint32_t *)off = __builtin_bswap32(val);
+ }
+ static INLINE void host_writeq(HostPt const off, const uint64_t val) {
+@@ -151,9 +157,11 @@ static INLINE uint64_t host_readq(ConstHostPt const off) {
+ }
+ 
+ static INLINE void host_writew(HostPt const off,const uint16_t val) {
++    if (dosbox_mcp_write_watch_enabled) DOSBoxMCPObserveHostWrite(off, val, 2);
+     *(uint16_t *)(off) = htole16(val);
+ }
+ static INLINE void host_writed(HostPt const off,const uint32_t val) {
++    if (dosbox_mcp_write_watch_enabled) DOSBoxMCPObserveHostWrite(off, val, 4);
+     *(uint32_t *)(off) = htole32(val);
+ }
+ static INLINE void host_writeq(HostPt const off,const uint64_t val) {

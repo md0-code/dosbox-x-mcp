@@ -1,11 +1,11 @@
 diff --git a/src/gui/sdlmain.cpp b/src/gui/sdlmain.cpp
-index b6227ba..51d07d5 100644
+index b6227ba..679c93e 100644
 --- a/src/gui/sdlmain.cpp
 +++ b/src/gui/sdlmain.cpp
 @@ -1022,6 +1022,34 @@ HWND GetHWND(void) {
  #endif
  }
- 
+
 +/* Optional no-focus keyboard control surface used by dosbox-x-mcp.
 + *
 + * RegisterWindowMessage keeps the protocol out of the fixed WM_APP range,
@@ -37,7 +37,16 @@ index b6227ba..51d07d5 100644
  HWND GetSurfaceHWND(void) {
  # if defined(C_SDL2)
      return GetHWND();
-@@ -2039,6 +2067,7 @@ void SDL_Prepare(void) {
+@@ -1037,6 +1065,8 @@ HWND GetSurfaceHWND(void) {
+ }
+ #endif
+
++#include "dosbox-x-mcp-v2.inc"
++
+ void SDL_rect_cliptoscreen(SDL_Rect &r) {
+     if (r.x < 0) {
+         r.w += r.x;
+@@ -2039,6 +2069,7 @@ void SDL_Prepare(void) {
  
  #if defined(WIN32) && !defined(HX_DOS) // Microsoft Windows specific
      SDL_EventState(SDL_SYSWMEVENT, SDL_ENABLE);
@@ -45,7 +54,15 @@ index b6227ba..51d07d5 100644
  #if !defined(C_SDL2)
      LOG(LOG_MISC,LOG_DEBUG)("Win32: Preparing main window to accept files dragged in from the Windows shell");
  
-@@ -5955,6 +5984,10 @@ void GFX_Events() {
+@@ -5893,4 +5925,7 @@ void GFX_Events() {
+ void GFX_Events() {
++    static bool dosbox_mcp_v2_initialized = (DOSBoxMCPV2Init(), true);
++    (void)dosbox_mcp_v2_initialized;
++    DOSBoxMCPV2Pump();
+     CheckMapperKeyboardLayout();
+ #if defined(C_SDL2) /* SDL 2.x---------------------------------- */
+     //Don't poll too often. This can be heavy on the OS, especially Macs.
+@@ -5955,6 +5990,10 @@ void GFX_Events() {
          switch (event.type) {
  #if defined(WIN32) && !defined(HX_DOS)
          case SDL_SYSWMEVENT:
@@ -56,7 +73,7 @@ index b6227ba..51d07d5 100644
              switch( event.syswm.msg->msg.win.msg ) {
                  case WM_COMMAND:
                      MSG_WM_COMMAND_handle(/*&*/(*event.syswm.msg));
-@@ -6389,6 +6422,10 @@ void GFX_Events() {
+@@ -6389,6 +6428,10 @@ void GFX_Events() {
          switch (event.type) {
  #ifdef __WIN32__
          case SDL_SYSWMEVENT : {

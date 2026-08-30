@@ -130,10 +130,13 @@ def launch(
     working_directory: str | None = None,
     isolated: bool = False,
     save_directory: Path | None = None,
+    companion_token: str | None = None,
 ) -> tuple[subprocess.Popen, Display | None]:
     """Start the emulator, optionally on a display of its own."""
     display: Display | None = None
     environment = dict(os.environ)
+    if companion_token is not None:
+        environment["DOSBOX_X_MCP_TOKEN"] = companion_token
     if isolated:
         host.require("isolated_display")
         display = start_display()

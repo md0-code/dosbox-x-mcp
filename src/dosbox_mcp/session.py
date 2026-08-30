@@ -33,6 +33,7 @@ from .platform import (
 )
 from .profile import SEGMENT_SIZE, Profile, ProfileError
 from .raw_keyboard import RawKey, resolve_raw_key
+from .companion import CompanionClient, CompanionError
 from .vga import Framebuffer
 
 BDA_BASE = 0x0400
@@ -152,13 +153,16 @@ class Session:
     display: object | None = None
     config: object | None = None
     state_directory: Path | None = None
+    companion_token: str | None = None
     traces: dict = field(default_factory=dict)
+    trace_schemas: dict[str, dict[str, str]] = field(default_factory=dict)
     _process: Process | None = None
     _framebuffer: Framebuffer | None = None
     _pressed_keys: dict[str, int] = field(default_factory=dict, repr=False)
     _bounded_keys: set[str] = field(default_factory=set, repr=False)
     _key_timers: dict[str, threading.Timer] = field(default_factory=dict, repr=False)
     _key_lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+    _companion: CompanionClient | None = field(default=None, repr=False)
 
     # ── plumbing ───────────────────────────────────────────────────────────
 
@@ -173,6 +177,24 @@ class Session:
         if self._process is not None:
             self._process.close()
             self._process = None
+        self._companion = None
+
+    def companion(self, required: bool = True) -> CompanionClient | None:
+        """Negotiate protocol v2 once, or return None for an unpatched/v1 guest."""
+        if self.companion_token is None:
+            if required:
+                raise SessionError("this session has no protocol-v2 launch token; launch it with dosbox_launch or attach with companion_token")
+            return None
+        if self._companion is None:
+            client = CompanionClient(self.pid, self.companion_token)
+            try:
+                client.negotiate()
+            except CompanionError as failure:
+                if required:
+                    raise SessionError(str(failure)) from None
+                return None
+            self._companion = client
+        return self._companion
 
     def window(self) -> Window | None:
         for candidate in find_windows(pid=self.pid):

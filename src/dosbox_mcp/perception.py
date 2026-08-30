@@ -212,6 +212,7 @@ def _translation_score(
     dx: int,
     dy: int,
     stride: int,
+    ignore_mask: bytes | None = None,
 ) -> tuple[float, int, int]:
     x0, y0, x1, y1 = _translation_bounds(width, height, dx, dy)
     matches = samples = 0
@@ -219,7 +220,11 @@ def _translation_score(
         before_row = (y - dy) * width
         after_row = y * width
         for x in range(x0, x1, stride):
-            matches += before[before_row + x - dx] == after[after_row + x]
+            source = before_row + x - dx
+            target = after_row + x
+            if ignore_mask is not None and (ignore_mask[source] or ignore_mask[target]):
+                continue
+            matches += before[source] == after[target]
             samples += 1
     return (matches / samples if samples else 0.0), matches, samples
 
@@ -235,6 +240,7 @@ def detect_translation(
     sample_stride: int = 2,
     bridge_radius: int = 0,
     min_changed_pixels: int = 1,
+    ignore_mask: bytes | None = None,
 ) -> dict[str, object]:
     """Find global frame translation and residual changes without optical flow.
 
@@ -249,12 +255,16 @@ def detect_translation(
         raise PerceptionError("translation bounds must be non-negative and smaller than the frame")
     if not 1 <= sample_stride <= 16:
         raise PerceptionError("sample_stride must be between 1 and 16")
+    if ignore_mask is not None and len(ignore_mask) != expected:
+        raise PerceptionError("translation ignore_mask must contain width*height bytes")
+    if ignore_mask is not None and all(ignore_mask):
+        raise PerceptionError("translation ignore_mask cannot exclude the entire frame")
 
     sampled: list[tuple[float, int, int]] = []
     for dy in range(-max_dy, max_dy + 1):
         for dx in range(-max_dx, max_dx + 1):
             ratio, _, _ = _translation_score(
-                before, after, width, height, dx, dy, sample_stride
+                before, after, width, height, dx, dy, sample_stride, ignore_mask
             )
             sampled.append((ratio, dx, dy))
     sampled.sort(key=lambda item: (-item[0], abs(item[1]) + abs(item[2]), item[2], item[1]))
@@ -267,7 +277,7 @@ def detect_translation(
     exact: list[dict[str, object]] = []
     for dx, dy in refine:
         ratio, matches, overlap = _translation_score(
-            before, after, width, height, dx, dy, 1
+            before, after, width, height, dx, dy, 1, ignore_mask
         )
         exact.append(
             {
@@ -321,6 +331,14 @@ def detect_translation(
             "translation": [second["dx"], second["dy"]],
             "match_ratio": round(float(second["match_ratio"]), 8),
         },
+        "top_candidates": [
+            {
+                "translation": [item["dx"], item["dy"]],
+                "match_ratio": round(float(item["match_ratio"]), 8),
+                "overlap_fraction": round(float(item["overlap_fraction"]), 8),
+            }
+            for item in exact[:16]
+        ],
         "ambiguity_margin": round(margin, 8),
         "confidence": round(confidence, 8),
         "residual": residual.as_dict(),
@@ -329,11 +347,174 @@ def detect_translation(
             "max_dy": max_dy,
             "sample_stride": sample_stride,
             "refined_candidates": len(exact),
+            "masked_pixels": sum(bool(value) for value in ignore_mask) if ignore_mask is not None else 0,
         },
         "epistemic_status": (
             "global indexed-pixel translation evidence; residual regions are "
             "changes after compensation, not semantic objects"
         ),
+    }
+
+
+def estimate_camera_path(
+    frames: Sequence[bytes],
+    width: int,
+    height: int,
+    *,
+    max_dx: int = 16,
+    max_dy: int = 16,
+    sample_stride: int = 2,
+    consensus_window: int = 3,
+    minimum_confidence: float = 0.25,
+    screen_fixed_mask: bytes | None = None,
+) -> dict[str, object]:
+    """Build a confidence-bearing camera trajectory from consecutive frames.
+
+    Pairwise translation stays available as the low-level primitive.  This
+    layer rejects isolated low-confidence jumps, applies a bounded temporal
+    median to plausible steps, accumulates coordinates, and reports exact
+    frame loop closures plus the resulting drift.
+    """
+    if len(frames) < 2:
+        raise PerceptionError("camera-path estimation requires at least two frames")
+    if not 1 <= consensus_window <= 15 or consensus_window % 2 == 0:
+        raise PerceptionError("consensus_window must be an odd number from 1 to 15")
+    expected = width * height
+    if any(len(frame) != expected for frame in frames):
+        raise PerceptionError("every camera-path frame must contain width*height bytes")
+    if screen_fixed_mask is not None and len(screen_fixed_mask) != expected:
+        raise PerceptionError("screen_fixed_mask must contain width*height bytes")
+
+    pairwise = [
+        detect_translation(
+            before,
+            after,
+            width,
+            height,
+            max_dx=max_dx,
+            max_dy=max_dy,
+            sample_stride=sample_stride,
+            ignore_mask=screen_fixed_mask,
+        )
+        for before, after in zip(frames, frames[1:])
+    ]
+    raw = [tuple(int(value) for value in result["best_translation"]) for result in pairwise]
+    confidences = [float(result["confidence"]) for result in pairwise]
+    radius = consensus_window // 2
+    accepted: list[tuple[int, int]] = []
+    outliers: list[dict[str, object]] = []
+    for index, ((dx, dy), confidence) in enumerate(zip(raw, confidences)):
+        start, stop = max(0, index - radius), min(len(raw), index + radius + 1)
+        plausible = [raw[item] for item in range(start, stop) if confidences[item] >= minimum_confidence]
+        if confidence < minimum_confidence or not plausible:
+            accepted.append((0, 0))
+            outliers.append({"transition": index + 1, "translation": [dx, dy], "confidence": confidence, "reason": "below confidence threshold"})
+            continue
+        xs = sorted(item[0] for item in plausible)
+        ys = sorted(item[1] for item in plausible)
+        consensus = (xs[len(xs) // 2], ys[len(ys) // 2])
+        if abs(dx - consensus[0]) > 1 or abs(dy - consensus[1]) > 1:
+            accepted.append(consensus)
+            outliers.append({"transition": index + 1, "translation": [dx, dy], "consensus": list(consensus), "confidence": confidence, "reason": "temporal-consensus outlier"})
+        else:
+            accepted.append((dx, dy))
+
+    gap_recoveries: list[dict[str, object]] = []
+    for index in range(len(accepted) - 1):
+        if confidences[index] >= minimum_confidence or confidences[index + 1] >= minimum_confidence:
+            continue
+        skipped = detect_translation(
+            frames[index],
+            frames[index + 2],
+            width,
+            height,
+            max_dx=min(width - 1, max_dx * 2),
+            max_dy=min(height - 1, max_dy * 2),
+            sample_stride=sample_stride,
+            ignore_mask=screen_fixed_mask,
+        )
+        if float(skipped["confidence"]) < minimum_confidence:
+            continue
+        recovered = tuple(int(value) for value in skipped["best_translation"])
+        accepted[index] = (0, 0)
+        accepted[index + 1] = recovered
+        gap_recoveries.append(
+            {
+                "unresolved_frame": index + 1,
+                "anchor_frames": [index, index + 2],
+                "aggregate_translation": list(recovered),
+                "confidence": skipped["confidence"],
+                "epistemic_status": "aggregate displacement across one unresolved frame; no position is assigned inside the gap",
+            }
+        )
+
+    path = [[0, 0]]
+    uncertainty = [[0.0, 0.0]]
+    for (dx, dy), confidence in zip(accepted, confidences):
+        path.append([path[-1][0] + dx, path[-1][1] + dy])
+        spread = max(0.0, 1.0 - confidence)
+        uncertainty.append([round(uncertainty[-1][0] + spread, 6), round(uncertainty[-1][1] + spread, 6)])
+
+    pre_correction_path = [point[:] for point in path]
+    first_seen: dict[bytes, int] = {}
+    closures: list[dict[str, object]] = []
+    for index, frame in enumerate(frames):
+        if frame in first_seen:
+            origin = first_seen[frame]
+            drift = [path[index][0] - path[origin][0], path[index][1] - path[origin][1]]
+            closures.append({"from_frame": origin, "to_frame": index, "exact_content": True, "drift": drift, "within_one_pixel": abs(drift[0]) <= 1 and abs(drift[1]) <= 1, "correction_applied": drift != [0, 0]})
+        else:
+            first_seen[frame] = index
+
+    # Exact byte-identical revisits are the only evidence allowed to close a
+    # loop.  Distribute the measured drift over the closed interval, then keep
+    # later coordinates in the corrected reference frame.  Raw coordinates
+    # remain available verbatim in pre_correction_path.
+    for closure in closures:
+        drift_x, drift_y = closure["drift"]
+        if drift_x == 0 and drift_y == 0:
+            continue
+        origin, end = int(closure["from_frame"]), int(closure["to_frame"])
+        span = end - origin
+        for position in range(origin + 1, end + 1):
+            fraction = (position - origin) / span
+            path[position][0] -= round(drift_x * fraction)
+            path[position][1] -= round(drift_y * fraction)
+        for position in range(end + 1, len(path)):
+            path[position][0] -= drift_x
+            path[position][1] -= drift_y
+
+    corrected_translations = [
+        [path[index + 1][0] - path[index][0], path[index + 1][1] - path[index][1]]
+        for index in range(len(path) - 1)
+    ]
+    outlier_transitions = {int(item["transition"]): item for item in outliers}
+    recovery_targets = {int(item["anchor_frames"][1]) for item in gap_recoveries}
+    placement_methods = ["direct"]
+    for index, (before_step, corrected_step) in enumerate(zip(raw, corrected_translations), start=1):
+        outlier = outlier_transitions.get(index)
+        if index in recovery_targets:
+            placement_methods.append("consensus_corrected")
+        elif outlier and outlier["reason"] == "below confidence threshold":
+            placement_methods.append("unresolved")
+        elif list(before_step) != corrected_step or outlier is not None:
+            placement_methods.append("consensus_corrected")
+        else:
+            placement_methods.append("direct")
+    return {
+        "frame_count": len(frames),
+        "pairwise": pairwise,
+        "accepted_translations": corrected_translations,
+        "pre_correction_translations": [list(item) for item in accepted],
+        "pre_correction_path": pre_correction_path,
+        "cumulative_path": path,
+        "placement_methods": placement_methods,
+        "uncertainty_pixels": uncertainty,
+        "outliers": outliers,
+        "gap_recoveries": gap_recoveries,
+        "loop_closures": closures,
+        "settings": {"consensus_window": consensus_window, "minimum_confidence": minimum_confidence, "screen_fixed_mask_pixels": sum(bool(value) for value in screen_fixed_mask) if screen_fixed_mask is not None else 0},
+        "epistemic_status": "multi-frame indexed-pixel camera evidence; low-confidence steps are rejected, not guessed",
     }
 
 
@@ -547,6 +728,82 @@ def rank_control_responses(trials: Sequence[dict[str, object]]) -> list[dict[str
         )
     ranked.sort(key=lambda item: (-float(item["score"]), str(item["action"])))
     return ranked
+
+
+def rank_joint_control_responses(
+    trials: Sequence[dict[str, object]], *, time_domain: str = "wall_clock_ms"
+) -> dict[str, object]:
+    """Rank camera, local-visual, memory and transition evidence separately.
+
+    Trial dictionaries are intentionally neutral observations.  An ``idle``
+    action supplies the per-channel noise floor; repeats establish support.
+    A weak camera channel is capped before combination so it cannot overrule
+    stronger memory or local-track evidence.
+    """
+    if not trials:
+        return {"channels": {}, "combined": [], "time_domain": time_domain}
+
+    def channel_values(trial: dict[str, object]) -> dict[str, float]:
+        motion = trial.get("global_motion") or {}
+        translation = motion.get("best_translation", [0, 0]) if isinstance(motion, dict) else [0, 0]
+        camera_confidence = float(motion.get("confidence", 0)) if isinstance(motion, dict) else 0.0
+        camera = (abs(float(translation[0])) + abs(float(translation[1]))) * camera_confidence
+        tracks = trial.get("tracks", [])
+        local = max((abs(float(track.get("dx", 0))) + abs(float(track.get("dy", 0)))) * float(track.get("confidence", 0)) for track in tracks) if tracks else 0.0
+        memory_deltas = trial.get("memory_deltas", {})
+        memory = max((abs(float(value)) for value in memory_deltas.values()), default=0.0) if isinstance(memory_deltas, dict) else 0.0
+        transition = float(trial.get("transition_fraction", 0.0))
+        return {"camera": camera, "local_visual": local, "memory": memory, "transition": transition}
+
+    controls = [channel_values(trial) for trial in trials if bool(trial.get("control"))]
+    idle = {name: (sum(item[name] for item in controls) / len(controls) if controls else 0.0) for name in ("camera", "local_visual", "memory", "transition")}
+    grouped: dict[str, list[tuple[dict[str, object], dict[str, float]]]] = {}
+    for trial in trials:
+        if bool(trial.get("control")):
+            continue
+        grouped.setdefault(str(trial.get("action", "")), []).append((trial, channel_values(trial)))
+
+    channels: dict[str, list[dict[str, object]]] = {name: [] for name in idle}
+    combined: list[dict[str, object]] = []
+    opposite_names = {"left": "right", "right": "left", "up": "down", "down": "up"}
+    for action, repeats in grouped.items():
+        per_channel: dict[str, dict[str, object]] = {}
+        for name in idle:
+            values = [item[1][name] for item in repeats]
+            mean = sum(values) / len(values)
+            excess = max(0.0, mean - idle[name])
+            repeat_support = sum(value > idle[name] for value in values) / len(values)
+            confidence = repeat_support * (excess / (excess + idle[name] + 1.0))
+            if name == "camera":
+                raw_confidence = [float((item[0].get("global_motion") or {}).get("confidence", 0)) for item in repeats]
+                confidence *= sum(raw_confidence) / len(raw_confidence)
+            entry = {"action": action, "mean_response": round(mean, 8), "idle_mean": round(idle[name], 8), "excess": round(excess, 8), "repeat_support": round(repeat_support, 8), "confidence": round(confidence, 8), "repeats": len(values)}
+            channels[name].append(entry)
+            per_channel[name] = entry
+
+        onset_values: list[float] = []
+        release_values: list[float] = []
+        for trial, _ in repeats:
+            samples = trial.get("memory_samples", [])
+            if not isinstance(samples, list) or len(samples) < 2:
+                continue
+            numeric = [key for key in samples[0] if key not in {"t_ms", "counter"}]
+            baseline = samples[0]
+            changed = [sample for sample in samples[1:] if any(sample.get(key) != baseline.get(key) for key in numeric)]
+            if changed:
+                onset_values.append(float(changed[0].get("counter", changed[0].get("t_ms", 0))))
+                returned = [sample for sample in changed[1:] if all(sample.get(key) == baseline.get(key) for key in numeric)]
+                if returned:
+                    release_values.append(float(returned[0].get("counter", returned[0].get("t_ms", 0))))
+        non_transition = [per_channel[name]["confidence"] for name in ("camera", "local_visual", "memory")]
+        strongest = max(float(value) for value in non_transition)
+        score = sum(float(value) for value in non_transition) / 3.0
+        combined.append({"action": action, "score": round(score, 8), "confidence": round(strongest, 8), "channels": per_channel, "transition_ranked_separately": True, "onset_latency": min(onset_values) if onset_values else None, "release_latency": min(release_values) if release_values else None, "time_domain": time_domain, "opposite_action": opposite_names.get(action), "opposite_available": opposite_names.get(action) in grouped})
+
+    for entries in channels.values():
+        entries.sort(key=lambda item: (-float(item["confidence"]), -float(item["excess"]), str(item["action"])))
+    combined.sort(key=lambda item: (-float(item["score"]), -float(item["confidence"]), str(item["action"])))
+    return {"idle_baseline": idle, "channels": channels, "combined": combined, "time_domain": time_domain, "epistemic_status": "channel-specific response evidence above repeated idle; transitions remain separate and no control semantics are asserted"}
 
 
 def _iou(left: BoundingBox, right: BoundingBox) -> float:

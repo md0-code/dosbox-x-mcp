@@ -18,6 +18,7 @@ import asyncio
 import concurrent.futures
 import json
 import os
+import secrets
 import subprocess
 import sys
 import time
@@ -30,16 +31,21 @@ from mcp.server.fastmcp import FastMCP, Image
 from mcp.types import ToolAnnotations
 
 from . import (
+    bundle as experiment_bundle,
     emulator,
     evidence as evidence_store,
     guest as dosguest,
     perception,
+    qualification,
+    quality as experiment_quality,
     platform as host,
     trace as tracing,
     vga,
     world as world_model,
+    writewatch,
 )
 from .profile import Profile, ProfileError, load_profile
+from .companion import CompanionError
 from .raw_keyboard import resolve_raw_key
 from .screen import CaptureError, capture_window, downscale_png, write_outputs
 from .session import Condition, Registry, Session, SessionError
@@ -54,7 +60,7 @@ DEFAULT_EXECUTABLE = os.environ.get("DOSBOX_MCP_EXECUTABLE")
 DEFAULT_OUTPUT_DIR = Path(os.environ.get("DOSBOX_MCP_OUTPUT_DIR", Path.cwd())).resolve()
 
 mcp = FastMCP(
-    "dosbox",
+    "dosbox_mcp",
     instructions=(
         "Drive a DOSBox-X guest headlessly: launch it, inject keys and clicks "
         "into the guest's own input state, read and patch any guest segment, "
@@ -321,6 +327,29 @@ class MovementTrial(BaseModel):
     positions: list[PositionSample] = Field(min_length=2, max_length=10000)
 
 
+class TimelineEvent(BaseModel):
+    """One action or observation scheduled against an explicit counter."""
+
+    at: int = Field(ge=0, description="Requested counter value relative to timeline start.")
+    kind: Literal["key_make", "key_break", "key_set", "capture_mark", "memory_snapshot", "trace_mark", "write_watch_start", "write_watch_stop"]
+    key: str | None = Field(default=None, description="Physical key for key_make/key_break.")
+    keys: list[str] = Field(default_factory=list, max_length=16, description="Simultaneous keys for key_set.")
+    label: str | None = Field(default=None, min_length=1, max_length=128)
+    physical_start: int | None = Field(default=None, ge=0, le=0x10FFFF, description="Bounded guest-physical start for memory_snapshot.")
+    length: int | None = Field(default=None, ge=1, le=65536, description="Bounded byte count for memory_snapshot.")
+    capture_bytes: int | None = Field(default=None, ge=1, le=1024 * 1024, description="Raw VGA backing bytes retained at a capture_mark.")
+    hit_limit: int | None = Field(default=None, ge=1, le=1000, description="Bounded raw hit limit for write_watch_start.")
+
+
+class BundleArtifact(BaseModel):
+    """One existing file copied and hashed into an experiment bundle."""
+
+    artifact_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$")
+    source: str = Field(description="Existing input file to copy into the bundle.")
+    bundle_path: str = Field(description="Portable relative path within the bundle.")
+    media_type: str = Field(default="application/octet-stream", max_length=128)
+
+
 # ── discovery and lifecycle ────────────────────────────────────────────────
 
 
@@ -418,17 +447,20 @@ async def dosbox_launch(
     state_path = Path(state_directory).resolve() if state_directory else None
     if state_path is not None:
         state_path.mkdir(parents=True, exist_ok=True)
+    companion_token = secrets.token_urlsafe(32)
     process, display = emulator.launch(
         binary_path,
         config_path,
         working_directory,
         isolated=isolated,
         save_directory=state_path,
+        companion_token=companion_token,
     )
     session = registry.attach(process.pid, resolved)
     session.display = display
     session.config = config_path
     session.state_directory = state_path
+    session.companion_token = companion_token
     registry.mark_launched(process.pid)
 
     def settle() -> str:
@@ -461,6 +493,7 @@ async def dosbox_launch(
         "config": str(config_path),
         "captures_directory": str(emulator.captures_directory(config_path)),
         "raw_keyboard": session.raw_keyboard_supported(),
+        "companion_v2": session.companion(required=False) is not None,
         "state_directory": str(state_path) if state_path is not None else None,
     }
 
@@ -476,9 +509,11 @@ async def dosbox_launch(
 async def dosbox_attach(
     pid: Annotated[int, Field(description="DOSBox-X process id.")],
     profile: str | None = None,
+    companion_token: Annotated[str | None, Field(description="Launch token for the optional protocol-v2 channel.")] = None,
 ) -> dict[str, Any]:
     resolved = _resolve_profile(profile)
     session = registry.attach(pid, resolved)
+    session.companion_token = companion_token
     await asyncio.to_thread(session.locate, True)
     window = session.window()
     return {
@@ -491,6 +526,7 @@ async def dosbox_attach(
         ),
         "keyboard_injection": session.ram_base is not None,
         "raw_keyboard": session.raw_keyboard_supported(),
+        "companion_v2": session.companion(required=False) is not None,
         "window_title": window.title if window else None,
     }
 
@@ -1018,7 +1054,11 @@ async def dosbox_capture_screen(
     ),
 )
 def dosbox_capabilities() -> dict[str, Any]:
-    return host.capabilities().as_dict()
+    result = host.capabilities().as_dict()
+    result["companion_protocol"] = 2
+    result["timeline_clocks"] = ["video_frame", "pic_us", "cpu_cycles", "wall_clock"]
+    result["bundle_schema"] = experiment_bundle.BUNDLE_SCHEMA
+    return result
 
 
 @mcp.tool(
@@ -1048,6 +1088,8 @@ async def dosbox_evidence_notebook(
     evidence: Annotated[list[str] | None, Field(max_length=32)] = None,
     label: Annotated[str | None, Field(max_length=128)] = None,
     confidence: Annotated[float | None, Field(ge=0, le=1)] = None,
+    artifact_refs: Annotated[list[str] | None, Field(max_length=64)] = None,
+    experiment_state: Literal["valid", "valid_with_ambiguity", "invalid", "incomplete"] | None = None,
 ) -> dict[str, Any]:
     target = _output(path)
     if operation == "list":
@@ -1067,6 +1109,10 @@ async def dosbox_evidence_notebook(
         return {"path": str(target), "subject": subject, "removed": removed}
     if status is None:
         raise SessionError("operation=upsert requires status")
+    if experiment_state in {"invalid", "incomplete"}:
+        raise SessionError(
+            f"experiment_state={experiment_state} cannot update the evidence notebook"
+        )
     entry = await asyncio.to_thread(
         evidence_store.upsert,
         target,
@@ -1075,6 +1121,7 @@ async def dosbox_evidence_notebook(
         evidence or [],
         label,
         confidence,
+        artifact_refs,
     )
     return {"path": str(target), "entry": entry}
 
@@ -1446,22 +1493,20 @@ async def dosbox_build_world_mosaic(
     def stitch() -> dict[str, Any]:
         loaded = [_indexed_frame(path, width, height) for path in frames]
         motion_reports: list[dict[str, object]] = []
+        camera_path: dict[str, object] | None = None
         if translations is None:
-            steps = []
-            for before, after in zip(loaded, loaded[1:]):
-                motion = perception.detect_translation(
-                    before[1],
-                    after[1],
-                    width,
-                    height,
-                    max_dx=max_translation_x,
-                    max_dy=max_translation_y,
-                    sample_stride=translation_sample_stride,
-                )
-                motion_reports.append(motion)
-                dx, dy = motion["best_translation"]
-                steps.append((int(dx), int(dy)))
-            translation_source = "automatically measured indexed-pixel translation"
+            camera_path = perception.estimate_camera_path(
+                [item[1] for item in loaded],
+                width,
+                height,
+                max_dx=max_translation_x,
+                max_dy=max_translation_y,
+                sample_stride=translation_sample_stride,
+            )
+            motion_reports = list(camera_path["pairwise"])
+            steps = [tuple(step) for step in camera_path["accepted_translations"]]
+            placement_methods = list(camera_path["placement_methods"])
+            translation_source = "multi-frame temporal-consensus indexed-pixel camera path"
         else:
             if len(translations) != len(loaded) - 1:
                 raise SessionError(
@@ -1469,6 +1514,7 @@ async def dosbox_build_world_mosaic(
                     f"expected {len(loaded) - 1}"
                 )
             steps = [(step.dx, step.dy) for step in translations]
+            placement_methods = ["direct"] * len(loaded)
             translation_source = "caller-supplied measured translation"
 
         mosaic = world_model.build_mosaic(
@@ -1477,6 +1523,7 @@ async def dosbox_build_world_mosaic(
             width,
             height,
             max_mosaic_pixels=max_mosaic_pixels,
+            placement_methods=placement_methods,
         )
         target = _output(stem)
         raw_path = target.with_suffix(".bin")
@@ -1498,6 +1545,7 @@ async def dosbox_build_world_mosaic(
             "translations": [list(step) for step in steps],
             "translation_source": translation_source,
             "translation_evidence": motion_reports,
+            "camera_path": camera_path,
             "ambiguous_transitions": [
                 index
                 for index, motion in enumerate(motion_reports, start=1)
@@ -2235,9 +2283,27 @@ async def dosbox_try_actions(
     await asyncio.to_thread(
         _locate_framebuffer, session, reference, allow_unconfirmed
     )
-    saved = await asyncio.to_thread(
-        emulator.save_branch_state, session.pid, session.state_directory
+    companion_method = getattr(session, "companion", None)
+    companion_client = companion_method(required=False) if companion_method else None
+    acknowledged_branching = bool(
+        companion_client is not None
+        and companion_client.capabilities.get("save_load_ack")
     )
+    if acknowledged_branching:
+        saved_ack = await asyncio.to_thread(companion_client.request, "save_state")
+        state_candidate = session.state_directory / "100.sav"
+        if not state_candidate.is_file() or state_candidate.stat().st_size == 0:
+            raise SessionError(f"acknowledged save completed but state is missing: {state_candidate}")
+        saved = {
+            "state_file": str(state_candidate),
+            "bytes": state_candidate.stat().st_size,
+            "acknowledged": True,
+            "events": saved_ack["events"],
+        }
+    else:
+        saved = await asyncio.to_thread(
+            emulator.save_branch_state, session.pid, session.state_directory
+        )
     state_file = Path(saved["state_file"])
     branches: list[dict[str, Any]] = []
     restore_count = 0
@@ -2245,12 +2311,16 @@ async def dosbox_try_actions(
     async def restore() -> dict[str, object]:
         nonlocal restore_count
         session.release_all_keys()
-        result = await asyncio.to_thread(
-            emulator.load_branch_state,
-            session.pid,
-            state_file,
-            restore_settle_seconds,
-        )
+        if acknowledged_branching:
+            result = await asyncio.to_thread(companion_client.request, "load_state")
+            result = {**result, "state_file": str(state_file), "acknowledged": True}
+        else:
+            result = await asyncio.to_thread(
+                emulator.load_branch_state,
+                session.pid,
+                state_file,
+                restore_settle_seconds,
+            )
         session.ds_base = 0
         session.ram_base = None
         await asyncio.to_thread(session.locate, True)
@@ -2292,6 +2362,7 @@ async def dosbox_try_actions(
         "trials": branches,
         "restore_count": restore_count,
         "baseline_restored": True,
+        "acknowledged_branching": acknowledged_branching,
         "final_restore": final_restore,
         "epistemic_status": (
             "independent branch observations from one emulator state; action labels "
@@ -2378,6 +2449,13 @@ async def dosbox_probe_controls(
         trial_result = {"action": action, "control": control, "tracks": tracks}
         if motion is not None:
             trial_result["global_motion"] = motion
+        trial_result["memory_deltas"] = {
+            name: item["delta"] for name, item in evidence["memory"]["fields"].items()
+        }
+        trial_result["memory_samples"] = evidence["memory"].get("samples", [])
+        trial_result["transition_fraction"] = evidence["visual"]["baseline_to_final"].get(
+            "changed_fraction", 0.0
+        )
         control_trials.append(trial_result)
         summaries.append(
             {
@@ -2420,6 +2498,9 @@ async def dosbox_probe_controls(
         "baseline_state": branched["baseline_state"],
         "baseline_restored": branched["baseline_restored"],
         "ranking": perception.rank_control_responses(control_trials),
+        "joint_ranking": perception.rank_joint_control_responses(
+            control_trials, time_domain="wall_clock_ms"
+        ),
         "trial_summaries": summaries,
         "epistemic_status": (
             "ranked repeatable visual response above idle; selected track IDs are "
@@ -2619,7 +2700,7 @@ async def dosbox_install_trace(
     segment: Annotated[int | str, Field(description="Guest code segment.")],
     call_at: Annotated[int | str, Field(description="Offset of the near CALL to displace.")],
     captures: Annotated[
-        list[str], Field(min_length=1, max_length=24, description="What to record at each hit.")
+        list[str], Field(max_length=24, description="Unlabelled values to record at each hit.")
     ],
     cave_at: Annotated[
         int | str, Field(description="Offset of a zero-filled run, from dosbox_find_cave.")
@@ -2631,24 +2712,34 @@ async def dosbox_install_trace(
     handle: Annotated[
         str | None, Field(description="Name for this trace; defaults to segment_offset.")
     ] = None,
+    capture_schema: Annotated[dict[str, str] | None, Field(max_length=24, description="Optional stable label-to-register-or-memory-expression mapping for arguments and selected state.")] = None,
 ) -> dict[str, Any]:
     session = _session(pid)
     where = int(segment, 0) if isinstance(segment, str) else segment
     site = int(call_at, 0) if isinstance(call_at, str) else call_at
     cave = int(cave_at, 0) if isinstance(cave_at, str) else cave_at
+    schema = dict(capture_schema or {})
+    if any(not label.strip() or len(label) > 64 for label in schema):
+        raise SessionError("trace schema labels must contain 1 to 64 characters")
+    requested = list(dict.fromkeys([*captures, *schema.values()]))
+    if not requested:
+        raise SessionError("trace installation needs captures or a capture_schema")
+    if len(requested) > 24:
+        raise SessionError("trace installation supports at most 24 distinct capture expressions")
 
     def put() -> dict[str, Any]:
         installed = tracing.install(
             session.guest(),
             where,
             site,
-            list(captures),
+            requested,
             cave,
             bytes.fromhex(expect_hex) if expect_hex else None,
             handle,
         )
         session.traces[installed.handle] = installed
-        return installed.describe()
+        session.trace_schemas[installed.handle] = schema
+        return {**installed.describe(), "capture_schema": schema}
 
     return {"pid": session.pid, **await asyncio.to_thread(put)}
 
@@ -2670,6 +2761,10 @@ async def dosbox_read_trace(
     session = _session(pid)
     installed = _trace_of(session, handle)
     result = await asyncio.to_thread(tracing.read, session.guest(), installed)
+    schema = session.trace_schemas.get(installed.handle, {})
+    values = result.get("values", {})
+    result["schema_values"] = {label: values[expression] for label, expression in schema.items()}
+    result["capture_schema"] = schema
     return {"pid": session.pid, **result}
 
 
@@ -2690,6 +2785,7 @@ async def dosbox_remove_trace(
     installed = _trace_of(session, handle)
     await asyncio.to_thread(tracing.remove, session.guest(), installed)
     session.traces.pop(installed.handle, None)
+    session.trace_schemas.pop(installed.handle, None)
     return {
         "pid": session.pid,
         "removed": installed.handle,
@@ -2711,6 +2807,636 @@ def _trace_of(session: Session, handle: str | None) -> tracing.Trace:
     raise SessionError(
         f"several traces are installed ({', '.join(sorted(session.traces))}); pass handle"
     )
+
+
+# ── post-perception reproducibility and emulator-time controls ────────────
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True),
+    description=(
+        "Run one ordered atomic timeline against an emulator-owned video-frame, "
+        "PIC-microsecond, or CPU-cycle counter. Every event returns requested and "
+        "actual counters with emulator acknowledgement. wall_clock is explicitly "
+        "labelled compatibility mode. Held keys are released on timeout or disconnect."
+    ),
+)
+async def dosbox_run_timeline(
+    events: Annotated[list[TimelineEvent], Field(min_length=1, max_length=4096)],
+    clock: Literal["video_frame", "pic_us", "cpu_cycles", "wall_clock"] = "video_frame",
+    pid: int | None = None,
+    timeout_seconds: Annotated[float, Field(gt=0, le=300)] = 30.0,
+    expire_after_counter: Annotated[int | None, Field(ge=1)] = None,
+) -> dict[str, Any]:
+    session = _session(pid)
+    client = session.companion(required=True)
+    assert client is not None
+    serialized: list[dict[str, Any]] = []
+    capture_total = 0
+    for order, event in enumerate(events):
+        item = event.model_dump(exclude_none=True)
+        item["order"] = order
+        if event.kind in {"key_make", "key_break"}:
+            if event.key is None:
+                raise SessionError(f"{event.kind} requires key")
+            item["key_id"] = resolve_raw_key(event.key).identifier
+        elif event.kind == "key_set":
+            if not event.keys:
+                raise SessionError("key_set requires at least one key")
+            item["key_ids"] = [resolve_raw_key(key).identifier for key in event.keys]
+        elif event.kind == "memory_snapshot":
+            if event.physical_start is None or event.length is None:
+                raise SessionError("memory_snapshot requires physical_start and length")
+        elif event.kind == "write_watch_start":
+            if event.physical_start is None or event.length is None or event.hit_limit is None:
+                raise SessionError("write_watch_start requires physical_start, length, and hit_limit")
+            capture_total += event.hit_limit * 256
+        elif event.kind == "capture_mark" and event.capture_bytes is not None:
+            capture_total += event.capture_bytes
+        serialized.append(item)
+    if capture_total > 1024 * 1024:
+        raise SessionError("one timeline may retain at most 1 MiB of raw video observations")
+    try:
+        result = await asyncio.to_thread(client.run_timeline, clock, serialized, timeout_seconds, expire_after_counter)
+    except Exception:
+        session.release_all_keys()
+        raise
+    return {"pid": session.pid, "clock": clock, "timing_claim": "wall_clock_compatibility" if clock == "wall_clock" else "emulator_owned", **result}
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True),
+    description="Negotiate the authenticated DOSBox-X companion protocol and return exact counters and capabilities.",
+)
+async def dosbox_companion_status(pid: int | None = None) -> dict[str, Any]:
+    session = _session(pid)
+    client = session.companion(required=True)
+    assert client is not None
+    result = await asyncio.to_thread(client.request, "status")
+    return {"pid": session.pid, "protocol": 2, **result}
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=True),
+    description=(
+        "Run repeated idle and key trials from one acknowledged save state using "
+        "VGA-frame timelines only. Captures raw video/DAC and selected memory at "
+        "the same emulator events, applies joint channel ranking and validity "
+        "gates, restores the baseline, and optionally emits a complete immutable bundle."
+    ),
+)
+async def dosbox_qualify_controls(
+    keys: Annotated[list[str], Field(min_length=1, max_length=12)],
+    hold_frames: Annotated[int, Field(ge=1, le=10000)] = 25,
+    observation_frames: Annotated[int, Field(ge=2, le=20000)] = 50,
+    repeats: Annotated[int, Field(ge=2, le=10)] = 2,
+    memory_fields: Annotated[list[MemoryProbe] | None, Field(max_length=32)] = None,
+    reference: str | None = None,
+    bundle_destination: str | None = None,
+    game_files: Annotated[list[str] | None, Field(max_length=32)] = None,
+    trace_files: Annotated[list[str] | None, Field(max_length=32, description="Optional bounded runtime trace reports to preserve in observations/traces.")] = None,
+    progress: bool = False,
+    pid: int | None = None,
+) -> dict[str, Any]:
+    def emit(message: str) -> None:
+        if progress:
+            print(f"  qualify: {message}", flush=True)
+
+    if hold_frames < 2:
+        raise SessionError("hold_frames must be at least 2 so make and held states are independently observable")
+    if hold_frames >= observation_frames:
+        raise SessionError("hold_frames must be smaller than observation_frames")
+    session = _session(pid)
+    if session.state_directory is None:
+        raise SessionError("qualification requires an isolated state_directory")
+    client = session.companion(required=True)
+    assert client is not None
+    if not all(client.capabilities.get(name) for name in ("timeline", "save_load_ack", "video_snapshot")):
+        raise SessionError("qualification requires timeline, save/load acknowledgement, and video snapshot capabilities")
+    canonical = list(dict.fromkeys(resolve_raw_key(key).name for key in keys))
+    located = await asyncio.to_thread(_locate_framebuffer, session, reference, False)
+    if not located.confirmed:
+        raise SessionError("qualification refuses an unconfirmed framebuffer")
+    emit("framebuffer confirmed")
+
+    probes: list[dict[str, Any]] = []
+    for probe in memory_fields or []:
+        segment = _segment_number(probe.segment)
+        if segment is None:
+            offset, profile_size = session.profile.resolve(probe.offset)
+            if session.profile.ds_segment is None:
+                raise SessionError(f"memory field {probe.label or probe.offset!r} needs an explicit segment")
+            segment = session.profile.ds_segment
+            size = probe.size or profile_size
+        else:
+            offset = int(probe.offset, 0) if isinstance(probe.offset, str) else int(probe.offset)
+            size = probe.size
+        if offset < 0 or offset + size > 0x10000:
+            raise SessionError(f"memory field {probe.label or probe.offset!r} crosses a segment boundary")
+        probes.append({"label": probe.label or str(probe.offset), "physical": (segment << 4) + offset, "length": size})
+
+    saved_ack = await asyncio.to_thread(client.request, "save_state")
+    state_file = session.state_directory / "100.sav"
+    if not state_file.is_file() or not state_file.stat().st_size:
+        raise SessionError("acknowledged baseline state file is missing or empty")
+    emit("baseline saved")
+
+    trial_specs = [(f"idle_r{index + 1}", "idle", True) for index in range(repeats)]
+    trial_specs += [(f"{key}_r{index + 1}", key, False) for key in canonical for index in range(repeats)]
+    analyzed: list[dict[str, Any]] = []
+    raw_records: list[dict[str, Any]] = []
+    memory_records: list[dict[str, Any]] = []
+    timeline_records: list[dict[str, Any]] = []
+    restore_events: list[dict[str, Any]] = []
+    baseline_hashes: list[str] = []
+    input_acknowledged = True
+    rejected_attempts: list[dict[str, Any]] = []
+
+    for label, action, control in trial_specs:
+        emit(f"starting {label}")
+        restored = await asyncio.to_thread(client.request, "load_state")
+        restore_events.append({"trial": label, **restored})
+        session.ds_base = 0
+        session.ram_base = None
+        await asyncio.to_thread(session.locate, True)
+        probe_video = await asyncio.to_thread(client.request, "video_snapshot", {"after_frames": 0, "max_bytes": 1024 * 1024})
+        probe_decoded = vga.decode_companion_snapshot(probe_video)
+        width, height = int(probe_decoded["width"]), int(probe_decoded["height"])
+        layout = str(probe_decoded["layout"])
+        if probe_decoded["kind"] != "indexed":
+            raise SessionError(f"control qualification requires indexed pixels; active layout is {layout}")
+        if layout == "dosbox_chain4_sparse":
+            capture_bytes = (int(probe_video["start_address"]) + width * height) * 4
+        elif layout == "plane_interleaved":
+            capture_bytes = (int(probe_video["start_address"]) + int(probe_video["plane_pitch"]) * height) * 4
+        else:
+            capture_bytes = int(probe_video["start_address"]) + int(probe_video["pitch"]) * height
+        if capture_bytes * 3 > 1024 * 1024:
+            raise SessionError(f"three atomic raw frame captures require {capture_bytes * 3} bytes, above the 1 MiB timeline limit")
+
+        scheduled: list[dict[str, Any]] = []
+        order_info: dict[int, tuple[str, str | None]] = {}
+
+        def add(at: int, kind: str, mark: str, **values: Any) -> None:
+            order = len(scheduled)
+            field_label = values.pop("field_label", None)
+            scheduled.append({"at": at, "order": order, "kind": kind, **values})
+            order_info[order] = (mark, field_label)
+
+        for at, mark in ((0, "baseline"), (hold_frames, "held"), (observation_frames, "final")):
+            add(at, "capture_mark", mark, capture_bytes=capture_bytes)
+            for probe in probes:
+                add(at, "memory_snapshot", mark, physical_start=probe["physical"], length=probe["length"], field_label=probe["label"])
+            if at == hold_frames and not control:
+                add(at, "key_break", "break", key_id=resolve_raw_key(action).identifier)
+        if not control:
+            # Stable ordering makes the at=0 baseline pre-input evidence, while
+            # the at=1 sample demonstrates that the guest observed the make.
+            add(0, "key_make", "make", key_id=resolve_raw_key(action).identifier)
+            for probe in probes:
+                add(1, "memory_snapshot", "make", physical_start=probe["physical"], length=probe["length"], field_label=probe["label"])
+        else:
+            add(0, "trace_mark", "idle_start")
+            for probe in probes:
+                add(1, "memory_snapshot", "make", physical_start=probe["physical"], length=probe["length"], field_label=probe["label"])
+        try:
+            timeline = await asyncio.to_thread(client.run_timeline, "video_frame", scheduled, 60.0)
+        except CompanionError as failure:
+            rejected_attempts.append({"trial": label, "attempt": 1, "state": "incomplete", "reason": str(failure)})
+            emit(f"retrying rejected {label}: {failure}")
+            retry_restore = await asyncio.to_thread(client.request, "load_state")
+            restore_events.append({"trial": label, "retry": True, **retry_restore})
+            timeline = await asyncio.to_thread(client.run_timeline, "video_frame", scheduled, 60.0)
+        emit(f"captured {label}")
+        events = timeline["timeline_events"]
+        if not control:
+            key_events = [event for event in events if event["kind"] in {"key_make", "key_break"}]
+            input_acknowledged &= len(key_events) == 2 and all(event.get("irq1_observed") and event["acknowledgement"] in {"key_applied", "key_released"} for event in key_events)
+        input_acknowledged &= bool(timeline.get("released_all_keys"))
+        frames: list[bytes] = []
+        counters: list[int] = []
+        samples: dict[str, dict[str, int]] = {mark: {"counter": at} for at, mark in ((0, "baseline"), (1, "make"), (hold_frames, "held"), (observation_frames, "final"))}
+        sanitized_events: list[dict[str, Any]] = []
+        for event in events:
+            clean = {key: value for key, value in event.items() if key != "observation"}
+            mark, field = order_info[int(event["order"])]
+            observation = event.get("observation")
+            if event["kind"] == "capture_mark" and isinstance(observation, dict):
+                decoded = vga.decode_companion_snapshot(observation)
+                frame = decoded["pixels"]
+                assert isinstance(frame, bytes)
+                frames.append(frame)
+                counters.append(int(event["actual_counter"]))
+                raw_records.append({"trial": label, "mark": mark, "counter": int(event["actual_counter"]), "frame": frame, "raw": decoded["raw"], "palette": decoded["palette"], "metadata": {key: value for key, value in observation.items() if key not in {"raw_hex", "dac_hex"}}})
+                clean["artifact_ref"] = f"frame:{label}:{mark}:indexed"
+            elif event["kind"] == "memory_snapshot" and isinstance(observation, dict) and field:
+                raw = bytes.fromhex(str(observation["hex"]))
+                samples[mark][field] = int.from_bytes(raw, "little")
+                clean["artifact_ref"] = f"memory:{label}:{mark}:{field}"
+                memory_records.append({"trial": label, "mark": mark, "field": field, "raw": raw})
+            sanitized_events.append(clean)
+        baseline_hashes.append(qualification.frame_hash(frames[0]))
+        trial = qualification.analyze_trial(action, frames, counters, [samples[mark] for mark in ("baseline", "make", "held", "final")], width, height, control=control)
+        trial["label"] = label
+        analyzed.append(trial)
+        timeline_records.append({"trial": label, "clock": "video_frame", "events": sanitized_events, "request_id": timeline["request_id"], "session_id": timeline["session_id"]})
+
+    final_restore = await asyncio.to_thread(client.request, "load_state")
+    final_video = await asyncio.to_thread(client.request, "video_snapshot", {"after_frames": 0, "max_bytes": 1024 * 1024})
+    final_decoded = vga.decode_companion_snapshot(final_video)
+    final_frame = final_decoded["pixels"]
+    assert isinstance(final_frame, bytes)
+    final_hash = qualification.frame_hash(final_frame)
+    agreement = qualification.repeat_agreement(analyzed)
+    ranking = perception.rank_joint_control_responses(analyzed, time_domain="video_frame")
+    camera_confidences = [float((trial.get("global_motion") or {}).get("confidence", 0.0)) for trial in analyzed if not trial["control"]]
+    gates = experiment_quality.evaluate(
+        exact_framebuffer=True,
+        baseline_hashes=baseline_hashes,
+        restore_hash=final_hash,
+        acknowledged_input=input_acknowledged,
+        acknowledged_restore=all(["load_started", "load_completed", "post_restore_frame"] == [event["type"] for event in restore["events"]] for restore in restore_events) and ["load_started", "load_completed", "post_restore_frame"] == [event["type"] for event in final_restore["events"]],
+        transition_fraction=max((float(trial["transition_fraction"]) for trial in analyzed if not trial["control"]), default=0.0),
+        repeats=repeats,
+        idle_repeats=repeats,
+        camera_confidence=min(camera_confidences) if camera_confidences else None,
+        cleanup_released=input_acknowledged,
+        repeat_agreement=agreement,
+        final_restore_ok=bool(baseline_hashes) and final_hash == baseline_hashes[0],
+    )
+
+    # Build neutral world evidence from the action trial with the greatest
+    # accepted displacement.  This is evidence selection, not a semantic claim
+    # that the selected action or memory fields have a particular meaning.
+    action_trials = [trial for trial in analyzed if not trial["control"]]
+    representative = max(
+        action_trials,
+        key=lambda trial: sum(abs(int(step[0])) + abs(int(step[1])) for step in trial["camera"]["accepted_translations"]),
+    )
+    representative_frames = [record["frame"] for record in raw_records if record["trial"] == representative["label"]]
+    representative_steps = [tuple(step) for step in representative["camera"]["accepted_translations"]]
+    mosaic = world_model.build_mosaic(
+        representative_frames,
+        representative_steps,
+        width,
+        height,
+        placement_methods=representative["camera"]["placement_methods"],
+    )
+    screen_regions = perception.infer_screen_regions(
+        representative_frames,
+        representative_steps,
+        width,
+        height,
+        min_episodes=1,
+    )
+    try:
+        tile_structure = world_model.infer_tile_structure(
+            mosaic.pixels,
+            mosaic.coverage,
+            mosaic.width,
+            mosaic.height,
+            candidate_sizes=[4, 8, 16, 32],
+            min_tiles=8,
+        )
+        tile_report: dict[str, Any] = tile_structure.report()
+    except world_model.WorldError as failure:
+        tile_structure = None
+        tile_report = {"status": "unresolved", "reason": str(failure), "epistemic_status": "no raw tile-grid candidate met the bounded evidence threshold"}
+
+    probe_labels = {probe["label"] for probe in probes}
+    x_field = next((name for name in ("player_x_copy", "player_x", "x") if name in probe_labels), None)
+    y_field = next((name for name in ("player_y_copy", "player_y", "y") if name in probe_labels), None)
+    direction_vectors = {"left": [-1, 0], "right": [1, 0], "up": [0, -1], "down": [0, 1]}
+    movement_trials = []
+    if x_field and y_field:
+        for trial in action_trials:
+            direction = direction_vectors.get(str(trial["action"]).lower())
+            if direction is None:
+                continue
+            movement_trials.append({
+                "label": trial["label"],
+                "direction": direction,
+                "positions": [[sample[x_field], sample[y_field]] for sample in trial["memory_samples"] if x_field in sample and y_field in sample],
+            })
+    constraints = (
+        world_model.infer_movement_constraints(movement_trials, min_trial_support=2)
+        if movement_trials
+        else {"candidate_count": 0, "movement_constraints": [], "status": "unresolved", "reason": "no paired coordinate probes were supplied", "epistemic_status": "no movement semantics asserted"}
+    )
+    world_evidence = {
+        "representative_trial": representative["label"],
+        "camera": representative["camera"],
+        "screen_regions": screen_regions,
+        "mosaic": mosaic.report(),
+        "tile_structure": tile_report,
+        "constraints": constraints,
+        "selection_rule": "greatest total accepted indexed-pixel displacement among non-idle restored trials",
+        "epistemic_status": "camera, mosaic, raw tile, and requested-motion evidence only; no game semantics confirmed",
+    }
+    emit("world evidence derived")
+    report: dict[str, Any] = {
+        "pid": session.pid,
+        "state": gates["state"],
+        "clock": "video_frame",
+        "hold_frames": hold_frames,
+        "observation_frames": observation_frames,
+        "repeats": repeats,
+        "keys": canonical,
+        "save": saved_ack,
+        "final_restore": final_restore,
+        "baseline_hashes": baseline_hashes,
+        "final_restore_hash": final_hash,
+        "trials": analyzed,
+        "joint_ranking": ranking,
+        "quality": gates,
+        "timeline_count": len(timeline_records),
+        "rejected_attempts": rejected_attempts,
+    }
+
+    if bundle_destination is not None:
+        emit("writing bundle")
+        destination = _output(bundle_destination)
+        status = await asyncio.to_thread(client.request, "status")
+        executable = session.process().executable_path()
+        config_path = Path(session.config) if session.config is not None else None
+        profile_path = session.profile.path
+        game_sources = [_input(game_file) for game_file in (game_files or [])]
+        metadata = {
+            "experiment_type": "controlled_input_qualification",
+            "emulator": status.get("build", {}),
+            "protocol": 2,
+            "mcp_version": "0.2.0",
+            "executable_sha256": experiment_bundle.sha256(executable.read_bytes()),
+            "effective_config_sha256": experiment_bundle.sha256(config_path.read_bytes()) if config_path and config_path.is_file() else None,
+            "profile_sha256": experiment_bundle.sha256(profile_path.read_bytes()) if profile_path.is_file() else None,
+            "framebuffer_confirmation": located.as_dict(),
+            "frame_dimensions": {"width": width, "height": height},
+            "quality_state": gates["state"],
+            "post_perception_complete": bool(trace_files),
+            "trace_artifact_count": len(trace_files or []),
+            "game_files": [{"name": source.name, "sha256": experiment_bundle.sha256(source.read_bytes())} for source in game_sources],
+        }
+        with experiment_bundle.BundleWriter(destination, metadata) as writer:
+            writer.add_json("emulator.build", "emulator/build.json", status.get("build", {}))
+            if config_path and config_path.is_file():
+                writer.add_file("emulator.config", "emulator/effective-config.conf", config_path, media_type="text/plain")
+            writer.add_file("baseline.state", "baseline/state.sav", state_file)
+            writer.add_bytes("baseline.frame", "baseline/frame.bin", next(record["frame"] for record in raw_records if record["mark"] == "baseline"))
+            baseline_memory = b"".join(record["raw"] for record in memory_records if record["trial"] == analyzed[0]["label"] and record["mark"] == "baseline")
+            writer.add_bytes("baseline.memory", "baseline/memory.bin", baseline_memory)
+            writer.add_json("timeline", "timeline.json", timeline_records)
+            for record in raw_records:
+                prefix = f"observations/frames/{record['trial']}/{record['mark']}"
+                writer.add_bytes(f"frame:{record['trial']}:{record['mark']}:raw", f"{prefix}.vga.bin", record["raw"])
+                writer.add_bytes(f"frame:{record['trial']}:{record['mark']}:indexed", f"{prefix}.bin", record["frame"])
+                writer.add_bytes(f"frame:{record['trial']}:{record['mark']}:dac", f"{prefix}.dac", record["palette"])
+                writer.add_json(f"frame:{record['trial']}:{record['mark']}:metadata", f"{prefix}.json", record["metadata"])
+            writer.add_json("observations.memory", "observations/memory/samples.json", [{"trial": trial["label"], "samples": trial["memory_samples"]} for trial in analyzed])
+            for record in memory_records:
+                writer.add_bytes(f"memory:{record['trial']}:{record['mark']}:{record['field']}", f"observations/memory/{record['trial']}/{record['mark']}-{record['field']}.bin", record["raw"])
+            input_ids = [f"frame:{record['trial']}:{record['mark']}:indexed" for record in raw_records]
+            input_hashes = [qualification.frame_hash(record["frame"]) for record in raw_records]
+            derivation = {"tool": "dosbox_qualify_controls", "parameters": {"hold_frames": hold_frames, "observation_frames": observation_frames, "repeats": repeats}, "input_artifact_ids": input_ids, "input_hashes": input_hashes}
+            writer.add_json("derived.comparisons", "derived/comparisons.json", [{"trial": trial["label"], "comparisons": trial["comparisons"]} for trial in analyzed], derivation=derivation)
+            writer.add_json("derived.camera", "derived/camera.json", [{"trial": trial["label"], "camera": trial["camera"]} for trial in analyzed], derivation=derivation)
+            writer.add_json("derived.world", "derived/world.json", world_evidence, derivation=derivation)
+            writer.add_bytes("derived.mosaic.pixels", "derived/mosaic.bin", mosaic.pixels, derivation=derivation)
+            writer.add_bytes("derived.mosaic.coverage", "derived/mosaic-coverage.bin", mosaic.coverage, derivation=derivation)
+            if tile_structure is not None:
+                writer.add_bytes("derived.tiles.raw", "derived/tiles.bin", tile_structure.tile_bytes, derivation=derivation)
+                writer.add_json("derived.tiles.map", "derived/tilemap.json", tile_report, derivation=derivation)
+            writer.add_json("derived.constraints", "derived/constraints.json", constraints, derivation=derivation)
+            trace_ids = []
+            for index, trace_path in enumerate(trace_files or []):
+                source = _input(trace_path)
+                artifact_id = f"observations.trace{index}"
+                writer.add_file(artifact_id, f"observations/traces/{index}-{source.name}", source, media_type="application/json")
+                trace_ids.append(artifact_id)
+            writer.add_json("evidence", "evidence.json", {"joint_ranking": ranking, "quality": gates, "rejected_attempts": rejected_attempts, "world_evidence": ["derived.world", "derived.constraints"], "trace_evidence": trace_ids, "epistemic_status": "observed and inferred channels only; no control semantics are confirmed"}, derivation=derivation)
+            for index, source in enumerate(game_sources):
+                writer.add_file(f"game.file{index}", f"emulator/game/{source.name}", source)
+            manifest = writer.finalize()
+        verification = experiment_bundle.verify(destination)
+        report["bundle"] = {"path": str(destination), "bundle_id": manifest["bundle_id"], "verification": verification}
+        emit("bundle finalized and verified")
+    return report
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False),
+    description="Create an immutable, atomically finalized experiment bundle from explicitly named artifacts. Every file is SHA-256 hashed and machine paths are deterministically redacted.",
+)
+async def dosbox_create_experiment_bundle(
+    destination: str,
+    artifacts: Annotated[list[BundleArtifact], Field(min_length=1, max_length=2000)],
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    target = _output(destination)
+
+    def create() -> dict[str, Any]:
+        with experiment_bundle.BundleWriter(target, metadata) as writer:
+            for artifact in artifacts:
+                writer.add_file(artifact.artifact_id, artifact.bundle_path, _input(artifact.source), media_type=artifact.media_type)
+            manifest = writer.finalize()
+        return {"bundle": str(target), "bundle_id": manifest["bundle_id"], "artifact_count": len(manifest["artifacts"]), "verified": experiment_bundle.verify(target)}
+
+    return await asyncio.to_thread(create)
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False),
+    description="Verify every declared size and SHA-256 hash in a finalized experiment bundle offline, rejecting missing, altered, undeclared, unsafe, or partial content.",
+)
+def dosbox_verify_experiment_bundle(path: str) -> dict[str, Any]:
+    target = Path(path)
+    if not target.is_absolute():
+        target = DEFAULT_OUTPUT_DIR / target
+    return experiment_bundle.verify(target)
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False),
+    description="Recompute qualification comparisons, camera, mosaic, raw tiles, and movement constraints from stored raw artifacts only and require byte-identical derived reports.",
+)
+def dosbox_reproduce_experiment_bundle(path: str) -> dict[str, Any]:
+    target = Path(path)
+    if not target.is_absolute():
+        target = DEFAULT_OUTPUT_DIR / target
+    return experiment_bundle.reproduce(target)
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False),
+    description="Evaluate strict or exploratory validity gates. Invalid and incomplete experiments are explicitly barred from automatic evidence-notebook updates.",
+)
+def dosbox_evaluate_experiment(
+    exact_framebuffer: bool | None,
+    baseline_hashes: list[str],
+    restore_hash: str | None,
+    acknowledged_input: bool | None,
+    acknowledged_restore: bool | None,
+    transition_fraction: Annotated[float | None, Field(ge=0, le=1)],
+    repeats: Annotated[int, Field(ge=0)],
+    idle_repeats: Annotated[int, Field(ge=0)],
+    camera_confidence: Annotated[float | None, Field(ge=0, le=1)],
+    cleanup_released: bool | None,
+    strict: bool = True,
+) -> dict[str, Any]:
+    return experiment_quality.evaluate(exact_framebuffer=exact_framebuffer, baseline_hashes=baseline_hashes, restore_hash=restore_hash, acknowledged_input=acknowledged_input, acknowledged_restore=acknowledged_restore, transition_fraction=transition_fraction, repeats=repeats, idle_repeats=idle_repeats, camera_confidence=camera_confidence, cleanup_released=cleanup_released, strict=strict)
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False),
+    description="Estimate a temporally consistent cumulative camera path from exact indexed frames, retaining top candidates, uncertainty, outliers, and exact-content loop-closure drift.",
+)
+async def dosbox_estimate_camera_path(
+    frames: Annotated[list[str], Field(min_length=2, max_length=1000)],
+    width: Annotated[int, Field(ge=1, le=4096)] = 320,
+    height: Annotated[int, Field(ge=1, le=4096)] = 200,
+    max_translation_x: Annotated[int, Field(ge=0, le=128)] = 16,
+    max_translation_y: Annotated[int, Field(ge=0, le=128)] = 16,
+    consensus_window: Annotated[int, Field(ge=1, le=15)] = 3,
+    minimum_confidence: Annotated[float, Field(ge=0, le=1)] = 0.25,
+    screen_fixed_mask: Annotated[str | None, Field(description="Optional width*height byte mask; non-zero pixels are excluded from translation scoring.")] = None,
+) -> dict[str, Any]:
+    loaded = [_indexed_frame(path, width, height)[1] for path in frames]
+    mask = _input(screen_fixed_mask).read_bytes() if screen_fixed_mask else None
+    return await asyncio.to_thread(perception.estimate_camera_path, loaded, width, height, max_dx=max_translation_x, max_dy=max_translation_y, consensus_window=consensus_window, minimum_confidence=minimum_confidence, screen_fixed_mask=mask)
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=True),
+    description="Observe writes to one bounded guest-physical range, returning writer CS:IP, before/after values, registers, emulator counters, hit counts, and timeline links. Requires protocol-v2 write_watch capability.",
+)
+async def dosbox_observe_writes(
+    physical_start: Annotated[int, Field(ge=0, le=0x10FFFF)],
+    length: Annotated[int, Field(ge=1, le=65536)],
+    duration_counter: Annotated[int, Field(ge=1)],
+    clock: Literal["video_frame", "pic_us", "cpu_cycles"] = "video_frame",
+    hit_limit: Annotated[int, Field(ge=1, le=1_000_000)] = 10000,
+    output_limit: Annotated[int, Field(ge=1, le=100000)] = 1000,
+    registers: Annotated[list[Literal["ax", "bx", "cx", "dx", "si", "di", "bp", "sp", "ds", "es", "ss"]] | None, Field(max_length=11)] = None,
+    pid: int | None = None,
+) -> dict[str, Any]:
+    session = _session(pid)
+    client = session.companion(required=True)
+    assert client is not None
+    raw = await asyncio.to_thread(client.request, "observe_writes", {"physical_start": physical_start, "length": length, "duration_counter": duration_counter, "clock": clock, "hit_limit": hit_limit, "registers": registers or []})
+    aggregated = writewatch.aggregate(raw.get("write_events", []), physical_start=physical_start, length=length, hit_limit=hit_limit, output_limit=output_limit)
+    return {"pid": session.pid, "clock": clock, **aggregated, "request_id": raw["request_id"], "session_id": raw["session_id"]}
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True),
+    description=(
+        "Capture DOSBox-X's active raw VGA backing memory and DAC at one acknowledged "
+        "emulated frame. Writes metadata, untouched raw memory, palette, and split "
+        "planes where applicable; unsupported layouts are labelled and never guessed."
+    ),
+)
+async def dosbox_capture_video_snapshot(
+    output_directory: str,
+    after_frames: Annotated[int, Field(ge=0, le=100000)] = 1,
+    max_bytes: Annotated[int, Field(ge=1, le=1024 * 1024)] = 1024 * 1024,
+    pid: int | None = None,
+) -> dict[str, Any]:
+    session = _session(pid)
+    client = session.companion(required=True)
+    assert client is not None
+    snapshot = await asyncio.to_thread(
+        client.request,
+        "video_snapshot",
+        {"after_frames": after_frames, "max_bytes": max_bytes},
+    )
+    try:
+        raw = bytes.fromhex(snapshot.pop("raw_hex"))
+        palette = bytes.fromhex(snapshot.pop("dac_hex"))
+    except (KeyError, ValueError) as failure:
+        raise SessionError(f"companion returned a malformed video snapshot: {failure}") from None
+    directory = _output(str(Path(output_directory) / "metadata.json")).parent
+    directory.mkdir(parents=True, exist_ok=True)
+    raw_path = directory / "vga-memory.bin"
+    palette_path = directory / "dac.bin"
+    raw_path.write_bytes(raw)
+    palette_path.write_bytes(palette)
+    artifacts: list[dict[str, Any]] = [
+        {"artifact_id": "video.raw", "path": str(raw_path), "bytes": len(raw), "sha256": experiment_bundle.sha256(raw)},
+        {"artifact_id": "video.dac", "path": str(palette_path), "bytes": len(palette), "sha256": experiment_bundle.sha256(palette)},
+    ]
+    if snapshot.get("layout") in {"plane_interleaved", "text_plane_interleaved"}:
+        for plane in range(4):
+            data = raw[plane::4]
+            plane_path = directory / f"plane-{plane}.bin"
+            plane_path.write_bytes(data)
+            artifacts.append({"artifact_id": f"video.plane{plane}", "path": str(plane_path), "bytes": len(data), "sha256": experiment_bundle.sha256(data)})
+    metadata = {**snapshot, "pid": session.pid, "artifacts": artifacts}
+    metadata_path = directory / "metadata.json"
+    metadata_bytes = experiment_bundle.canonical_json(metadata)
+    metadata_path.write_bytes(metadata_bytes)
+    artifacts.append({"artifact_id": "video.metadata", "path": str(metadata_path), "bytes": len(metadata_bytes), "sha256": experiment_bundle.sha256(metadata_bytes)})
+    return {**metadata, "artifacts": artifacts}
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False),
+    description=(
+        "Decode an exact raw Mode X, planar EGA/VGA, text, or packed VESA snapshot. "
+        "Raw planes remain untouched; output is accepted as confirmed only when it "
+        "matches the supplied exact reference. Unsupported layouts are refused."
+    ),
+)
+async def dosbox_decode_video_snapshot(
+    mode: Literal["mode_x", "planar_4bpp", "text", "vesa_linear"],
+    sources: Annotated[list[str], Field(min_length=1, max_length=4)],
+    output: str,
+    width: Annotated[int, Field(ge=1, le=8192)],
+    height: Annotated[int, Field(ge=1, le=8192)],
+    pitch: Annotated[int | None, Field(ge=1)] = None,
+    start_address: Annotated[int, Field(ge=0)] = 0,
+    bytes_per_pixel: Annotated[int, Field(ge=1, le=4)] = 1,
+    reference: str | None = None,
+    allow_unconfirmed: bool = False,
+) -> dict[str, Any]:
+    paths = [_input(source) for source in sources]
+    raw = [path.read_bytes() for path in paths]
+    if mode in {"mode_x", "planar_4bpp"}:
+        if len(raw) != 4:
+            raise SessionError(f"{mode} requires exactly four raw plane files")
+        planes = tuple(raw)
+        decoded = (
+            vga.decode_mode_x(planes, width, height, start_address=start_address, pitch=pitch)
+            if mode == "mode_x"
+            else vga.decode_planar_4bpp(planes, width, height, start_address=start_address, pitch=pitch)
+        )
+    elif mode == "vesa_linear":
+        if len(raw) != 1 or pitch is None:
+            raise SessionError("vesa_linear requires one source and explicit pitch")
+        decoded = vga.decode_vesa_linear(raw[0], width, height, pitch=pitch, bytes_per_pixel=bytes_per_pixel, start_address=start_address)
+    else:
+        if len(raw) != 1:
+            raise SessionError("text mode requires one interleaved character/attribute source")
+        cells = vga.decode_text_cells(raw[0], width, height, start_address=start_address, pitch=pitch)
+        decoded = experiment_bundle.canonical_json(cells)
+    confirmed = False
+    if reference is not None:
+        confirmed = decoded == _input(reference).read_bytes()
+        if not confirmed:
+            raise SessionError("decoded video output does not exactly match the supplied reference")
+    elif not allow_unconfirmed:
+        raise SessionError("an exact reference is required; pass allow_unconfirmed only for exploratory decoding")
+    target = _output(output)
+    target.write_bytes(decoded)
+    return {
+        "mode": mode,
+        "dimensions": [width, height],
+        "pitch": pitch,
+        "start_address": start_address,
+        "bytes_per_pixel": bytes_per_pixel,
+        "raw_sources": [{"path": str(path), "bytes": len(data), "sha256": experiment_bundle.sha256(data)} for path, data in zip(paths, raw)],
+        "decoded": {"path": str(target), "bytes": len(decoded), "sha256": experiment_bundle.sha256(decoded)},
+        "confirmed": confirmed,
+        "note": "raw planes/pages are preserved at their source paths",
+    }
 
 
 def main() -> None:

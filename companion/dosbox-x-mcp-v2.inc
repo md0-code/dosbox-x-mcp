@@ -454,7 +454,7 @@ static bool DOSBoxMCPV2ParseTimeline(const std::string &json) {
         event.capture_bytes = (uint32_t)DOSBoxMCPV2Integer(object, "capture_bytes");
         event.hit_limit = (uint32_t)DOSBoxMCPV2Integer(object, "hit_limit");
         captured_bytes += event.capture_bytes;
-        if (event.kind == "memory_snapshot")
+        if (event.kind == "memory_snapshot" || event.kind == "presentation_snapshot")
             captured_bytes += event.length;
         if (event.kind == "write_watch_start") {
             if (event.hit_limit == 0 || event.hit_limit > 1000) return false;
@@ -480,7 +480,7 @@ static void DOSBoxMCPV2Begin(const std::string &json) {
         std::ostringstream result;
         result << "{\"build\":{\"dosbox_x_version\":\"" << VERSION << "\",\"source_tag\":\"dosbox-x-v2026.07.02\",\"companion_protocol\":2},"
                "\"capabilities\":{\"timeline\":true,\"authentic_keyboard\":true,\"save_load_ack\":true,"
-               "\"write_watch\":true,\"video_snapshot\":true,\"transport\":\""
+               "\"write_watch\":true,\"video_snapshot\":true,\"presentation_snapshot\":true,\"transport\":\""
 #if defined(WIN32)
                << "windows_named_pipe"
 #else
@@ -726,6 +726,19 @@ static void DOSBoxMCPV2Pump(void) {
             event.acknowledgement = "memory_snapshot_mark";
             if (event.length && event.length <= 65536 && event.physical <= 0x10ffff && event.physical + event.length <= 0x110000)
                 event.observation = DOSBoxMCPV2MemoryObservation(event.physical, event.length);
+        }
+        else if (event.kind == "presentation_snapshot") {
+            event.acknowledgement = "presentation_snapshot_mark";
+            if (event.capture_bytes && event.length && event.length <= 65536 &&
+                event.physical <= 0x10ffff && event.physical + event.length <= 0x110000) {
+                /* Both observations are copied in this one vertical-retrace pump
+                 * invocation, before guest execution resumes.  This gives the
+                 * memory values the same emulator observation point as raw VGA
+                 * backing memory and the six-bit DAC. */
+                event.observation = std::string("{\"memory\":") +
+                    DOSBoxMCPV2MemoryObservation(event.physical, event.length) +
+                    ",\"video\":" + DOSBoxMCPV2VideoObservation(event.capture_bytes) + "}";
+            }
         }
         else if (event.kind == "write_watch_start" && event.length && event.length <= 65536 && event.physical <= 0x10ffff && event.physical + event.length <= 0x110000 && event.hit_limit && event.hit_limit <= 1000 && !dosbox_mcp_write_watch_enabled) {
             dosbox_mcp_v2_watch_start = event.physical;

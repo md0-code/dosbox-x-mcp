@@ -331,13 +331,13 @@ class TimelineEvent(BaseModel):
     """One action or observation scheduled against an explicit counter."""
 
     at: int = Field(ge=0, description="Requested counter value relative to timeline start.")
-    kind: Literal["key_make", "key_break", "key_set", "capture_mark", "memory_snapshot", "trace_mark", "write_watch_start", "write_watch_stop"]
+    kind: Literal["key_make", "key_break", "key_set", "capture_mark", "memory_snapshot", "presentation_snapshot", "trace_mark", "write_watch_start", "write_watch_stop"]
     key: str | None = Field(default=None, description="Physical key for key_make/key_break.")
     keys: list[str] = Field(default_factory=list, max_length=16, description="Simultaneous keys for key_set.")
     label: str | None = Field(default=None, min_length=1, max_length=128)
-    physical_start: int | None = Field(default=None, ge=0, le=0x10FFFF, description="Bounded guest-physical start for memory_snapshot.")
-    length: int | None = Field(default=None, ge=1, le=65536, description="Bounded byte count for memory_snapshot.")
-    capture_bytes: int | None = Field(default=None, ge=1, le=1024 * 1024, description="Raw VGA backing bytes retained at a capture_mark.")
+    physical_start: int | None = Field(default=None, ge=0, le=0x10FFFF, description="Bounded guest-physical start for memory_snapshot or presentation_snapshot.")
+    length: int | None = Field(default=None, ge=1, le=65536, description="Bounded byte count for memory_snapshot or presentation_snapshot.")
+    capture_bytes: int | None = Field(default=None, ge=1, le=1024 * 1024, description="Raw VGA backing bytes retained at a capture_mark or presentation_snapshot.")
     hit_limit: int | None = Field(default=None, ge=1, le=1000, description="Bounded raw hit limit for write_watch_start.")
 
 
@@ -2847,6 +2847,10 @@ async def dosbox_run_timeline(
         elif event.kind == "memory_snapshot":
             if event.physical_start is None or event.length is None:
                 raise SessionError("memory_snapshot requires physical_start and length")
+        elif event.kind == "presentation_snapshot":
+            if event.physical_start is None or event.length is None or event.capture_bytes is None:
+                raise SessionError("presentation_snapshot requires physical_start, length, and capture_bytes")
+            capture_total += event.length + event.capture_bytes
         elif event.kind == "write_watch_start":
             if event.physical_start is None or event.length is None or event.hit_limit is None:
                 raise SessionError("write_watch_start requires physical_start, length, and hit_limit")

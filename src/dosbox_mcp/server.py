@@ -354,7 +354,12 @@ class BundleArtifact(BaseModel):
 
 
 @mcp.tool(
-    annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
     description=(
         "List the game profiles this server knows and, for one of them, every "
         "named memory offset it exposes.  A profile says how to recognise the "
@@ -396,7 +401,12 @@ def dosbox_profiles(profile: str | None = None) -> dict[str, Any]:
 
 
 @mcp.tool(
-    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True),
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
     description=(
         "Start DOSBox-X with a config file and attach to it.  Returns the process "
         "id every other tool takes.  The config's [autoexec] section decides what "
@@ -499,7 +509,12 @@ async def dosbox_launch(
 
 
 @mcp.tool(
-    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True),
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
     description=(
         "Attach to a DOSBox-X process that is already running, by process id, and "
         "locate the game's data segment inside it.  Use dosbox_sessions to find "
@@ -532,7 +547,12 @@ async def dosbox_attach(
 
 
 @mcp.tool(
-    annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
     description=(
         "List attached sessions and any other visible DOSBox-X windows on the "
         "machine, with their process ids."
@@ -571,7 +591,12 @@ def dosbox_sessions(window_title: str | None = None) -> dict[str, Any]:
 
 
 @mcp.tool(
-    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True),
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
     description=(
         "Close a DOSBox-X session.  By default only sessions this server "
         "launched may be killed; pass force to end one it merely attached to.  "
@@ -608,7 +633,12 @@ async def dosbox_quit(
 
 
 @mcp.tool(
-    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True),
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
     description=(
         "Type into the guest by appending to its BIOS keyboard ring buffer -- no "
         "window focus, no host keystrokes.  Each item is a single character or a "
@@ -630,7 +660,12 @@ async def dosbox_send_keys(
 
 
 @mcp.tool(
-    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True),
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
     description=(
         "Set one authentic DOSBox-X keyboard make/break state without activating "
         "its window.  This requires the versioned companion keyboard hook.  A "
@@ -653,7 +688,12 @@ async def dosbox_key_state(
 
 
 @mcp.tool(
-    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True),
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
     description=(
         "Hold one or more physical keys simultaneously through DOSBox-X's own "
         "KEYBOARD_AddKey path, then release every key in reverse order even if "
@@ -672,7 +712,12 @@ async def dosbox_hold_keys(
 
 
 @mcp.tool(
-    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True),
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
     description=(
         "Click at a guest screen coordinate by writing the game's own mouse "
         "state, the words its INT 33h handler normally fills in.  The host "
@@ -700,7 +745,12 @@ async def dosbox_click(
 
 
 @mcp.tool(
-    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True),
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
     description=(
         "Hold mouse buttons down for a stretch of time by writing the guest's "
         "button word continuously -- the way to drive anything that reads a held "
@@ -749,7 +799,12 @@ async def dosbox_hold_buttons(
 
 
 @mcp.tool(
-    annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
     description=(
         "Read bytes from the guest.  With no segment this is the game's own "
         "data segment and `offset` may be a profile symbol name; with "
@@ -803,7 +858,12 @@ async def dosbox_read_memory(
 
 
 @mcp.tool(
-    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True),
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
     description=(
         "Patch the game's data segment.  This is how to set up a state that "
         "would otherwise take hours of play -- a treasury, a rank, a flag -- so "
@@ -861,13 +921,21 @@ async def dosbox_write_memory(
 
 
 @mcp.tool(
-    annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
     description=(
         "Write a whole 64 KiB guest segment to a file -- the state at one "
         "instant, for later analysis or as a test fixture.  With no segment "
         "this is the profile's data segment; with segment=0x1234 it is any "
         "segment in the guest, which is how the marker for a new profile is "
-        "captured."
+        "captured. Reads guest memory without intentionally modifying it, but creates "
+        "or overwrites the selected host file and may create parent directories. "
+        "Relative paths use DOSBOX_MCP_OUTPUT_DIR; absolute paths are accepted. "
+        "This output directory is a default location, not a sandbox."
     ),
 )
 async def dosbox_dump_segment(
@@ -900,7 +968,12 @@ async def dosbox_dump_segment(
 
 
 @mcp.tool(
-    annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
     description=(
         "Block until a memory field satisfies a test, or the timeout runs out.  "
         "Use it to wait for a screen transition, an animation to finish, or a "
@@ -931,7 +1004,12 @@ async def dosbox_wait_for(
 
 
 @mcp.tool(
-    annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
     description=(
         "Look at the emulator's screen.  Returns the current frame as an image, "
         "photographed from the window without activating it.  Use this to see "
@@ -954,7 +1032,12 @@ async def dosbox_view_screen(
 
 
 @mcp.tool(
-    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True),
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
     description=(
         "Capture the current frame exactly and save it: <stem>.rgb (one byte "
         "per pixel), <stem>.png, and with with_segment also <stem>_ds.bin, the "
@@ -1045,7 +1128,12 @@ async def dosbox_capture_screen(
 
 
 @mcp.tool(
-    annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
     description=(
         "What this host can do, and what it cannot.  Guest memory works "
         "everywhere there is a backend; window capture and the emulator's own "
@@ -1127,7 +1215,12 @@ async def dosbox_evidence_notebook(
 
 
 @mcp.tool(
-    annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
     description=(
         "Find the DOS guest inside an emulator process and report what is "
         "loaded in it -- with no profile and no prior knowledge.  This is the "
@@ -1161,7 +1254,12 @@ async def dosbox_find_guest(pid: int | None = None) -> dict[str, Any]:
 
 
 @mcp.tool(
-    annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
     description=(
         "Search the guest's 640 KiB of conventional memory for a byte pattern "
         "and report every hit as a guest segment:offset.  This is how a known "
@@ -1201,7 +1299,12 @@ async def dosbox_search_memory(
 
 
 @mcp.tool(
-    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True),
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
     description=(
         "Fire one of DOSBox-X's own menu items without focus and without a "
         "keystroke: record_opl, record_midi, record_wave, record_video, "
@@ -1226,7 +1329,12 @@ async def dosbox_emulator_command(
 
 
 @mcp.tool(
-    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True),
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
     description=(
         "Record the guest's sound for a stretch of time and return the file "
         "that appeared: an OPL register log (.dro), the MIDI stream (.mid) or "
@@ -1451,7 +1559,7 @@ async def dosbox_compare_frames(
 @mcp.tool(
     annotations=ToolAnnotations(
         readOnlyHint=False,
-        destructiveHint=False,
+        destructiveHint=True,
         idempotentHint=True,
         openWorldHint=False,
     ),
@@ -1732,7 +1840,12 @@ def dosbox_correlate_memory(
 
 
 @mcp.tool(
-    annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
     description=(
         "Read the guest's screen straight out of the emulator's video memory: "
         "the palette indices the guest wrote, at the instant of the read, with "
@@ -1748,7 +1861,11 @@ def dosbox_correlate_memory(
         "the guess anyway.\n\n"
         "Writes <stem>.bin (one byte per pixel) and <stem>.png when stem is "
         "given.  A page-flipping game has more than one page; pass page_offset "
-        "from the pages list to read the other."
+        "from the pages list to read the other. Without stem, this call does not "
+        "export files. With stem, it creates or overwrites the .bin and .png host "
+        "files and may create parent directories. An existing stem suffix is "
+        "replaced with .bin and .png. Its annotations cover that exporting "
+        "capability as well as inspection-only calls."
     ),
 )
 async def dosbox_read_framebuffer(
@@ -1965,7 +2082,7 @@ def _perform_action(session: Session, action: ExperimentAction, observation_seco
 @mcp.tool(
     annotations=ToolAnnotations(
         readOnlyHint=False,
-        destructiveHint=False,
+        destructiveHint=True,
         idempotentHint=False,
         openWorldHint=True,
     ),
@@ -2513,7 +2630,12 @@ async def dosbox_probe_controls(
 
 
 @mcp.tool(
-    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True),
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
     description=(
         "Watch the guest's video memory and return every distinct frame it put "
         "up, with the moment each appeared.  This is how to measure an "
@@ -2575,7 +2697,12 @@ async def dosbox_watch_frames(
 
 
 @mcp.tool(
-    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True),
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
     description=(
         "Sample a set of memory fields repeatedly and write the series as a "
         "TSV.  dosbox_read_memory answers what a value is and dosbox_wait_for "
@@ -2651,7 +2778,12 @@ async def dosbox_sample(
 
 
 @mcp.tool(
-    annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
     description=(
         "Find runs of zero in a guest code segment long enough to hold a trace "
         "cave.  Padding between routines is the usual supply.  Longest first; "
@@ -2680,7 +2812,12 @@ async def dosbox_find_cave(
 
 
 @mcp.tool(
-    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True),
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
     description=(
         "Watch a running guest's code without a debugger.  Redirects one near "
         "CALL in the live code segment through a zero-filled cave that calls "
@@ -2745,7 +2882,12 @@ async def dosbox_install_trace(
 
 
 @mcp.tool(
-    annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
     description=(
         "Read what an installed trace has recorded: the values from its most "
         "recent hit, and how many times it has fired.  A hit count of zero "
@@ -2769,7 +2911,12 @@ async def dosbox_read_trace(
 
 
 @mcp.tool(
-    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True),
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
     description=(
         "Remove an installed trace: the call site is restored first so nothing "
         "new can enter the cave, then the cave is blanked."
@@ -2813,7 +2960,12 @@ def _trace_of(session: Session, handle: str | None) -> tracing.Trace:
 
 
 @mcp.tool(
-    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True),
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
     description=(
         "Run one ordered atomic timeline against an emulator-owned video-frame, "
         "PIC-microsecond, or CPU-cycle counter. Every event returns requested and "
@@ -2869,7 +3021,12 @@ async def dosbox_run_timeline(
 
 
 @mcp.tool(
-    annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True),
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
     description="Negotiate the authenticated DOSBox-X companion protocol and return exact counters and capabilities.",
 )
 async def dosbox_companion_status(pid: int | None = None) -> dict[str, Any]:
@@ -2881,7 +3038,12 @@ async def dosbox_companion_status(pid: int | None = None) -> dict[str, Any]:
 
 
 @mcp.tool(
-    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=True),
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
     description=(
         "Run repeated idle and key trials from one acknowledged save state using "
         "VGA-frame timelines only. Captures raw video/DAC and selected memory at "
@@ -3227,7 +3389,12 @@ async def dosbox_qualify_controls(
 
 
 @mcp.tool(
-    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False),
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=False,
+    ),
     description="Create an immutable, atomically finalized experiment bundle from explicitly named artifacts. Every file is SHA-256 hashed and machine paths are deterministically redacted.",
 )
 async def dosbox_create_experiment_bundle(
@@ -3248,7 +3415,12 @@ async def dosbox_create_experiment_bundle(
 
 
 @mcp.tool(
-    annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False),
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
     description="Verify every declared size and SHA-256 hash in a finalized experiment bundle offline, rejecting missing, altered, undeclared, unsafe, or partial content.",
 )
 def dosbox_verify_experiment_bundle(path: str) -> dict[str, Any]:
@@ -3259,7 +3431,12 @@ def dosbox_verify_experiment_bundle(path: str) -> dict[str, Any]:
 
 
 @mcp.tool(
-    annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False),
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
     description="Recompute qualification comparisons, camera, mosaic, raw tiles, and movement constraints from stored raw artifacts only and require byte-identical derived reports.",
 )
 def dosbox_reproduce_experiment_bundle(path: str) -> dict[str, Any]:
@@ -3270,7 +3447,12 @@ def dosbox_reproduce_experiment_bundle(path: str) -> dict[str, Any]:
 
 
 @mcp.tool(
-    annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False),
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
     description="Evaluate strict or exploratory validity gates. Invalid and incomplete experiments are explicitly barred from automatic evidence-notebook updates.",
 )
 def dosbox_evaluate_experiment(
@@ -3290,7 +3472,12 @@ def dosbox_evaluate_experiment(
 
 
 @mcp.tool(
-    annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False),
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
     description="Estimate a temporally consistent cumulative camera path from exact indexed frames, retaining top candidates, uncertainty, outliers, and exact-content loop-closure drift.",
 )
 async def dosbox_estimate_camera_path(
@@ -3309,7 +3496,12 @@ async def dosbox_estimate_camera_path(
 
 
 @mcp.tool(
-    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=True),
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
     description="Observe writes to one bounded guest-physical range, returning writer CS:IP, before/after values, registers, emulator counters, hit counts, and timeline links. Requires protocol-v2 write_watch capability.",
 )
 async def dosbox_observe_writes(
@@ -3331,7 +3523,12 @@ async def dosbox_observe_writes(
 
 
 @mcp.tool(
-    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True),
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
     description=(
         "Capture DOSBox-X's active raw VGA backing memory and DAC at one acknowledged "
         "emulated frame. Writes metadata, untouched raw memory, palette, and split "
@@ -3382,7 +3579,12 @@ async def dosbox_capture_video_snapshot(
 
 
 @mcp.tool(
-    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False),
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
     description=(
         "Decode an exact raw Mode X, planar EGA/VGA, text, or packed VESA snapshot. "
         "Raw planes remain untouched; output is accepted as confirmed only when it "

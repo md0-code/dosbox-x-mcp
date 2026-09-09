@@ -100,9 +100,7 @@ there is never any doubt where a file went.
 Captures can leave guest memory unchanged while creating parent directories
 and creating or overwriting host files. `DOSBOX_MCP_OUTPUT_DIR` is the base for relative
 paths, not an enforced boundary; absolute paths are supported. Use distinct
-filenames to retain separate observations. Tool annotations describe supported
-side effects; they do not enforce OS permissions or replace the client's approval
-policy. See [tool annotation contracts](docs/TOOL_ANNOTATIONS.md).
+filenames to retain separate observations.
 
 ## Tools
 

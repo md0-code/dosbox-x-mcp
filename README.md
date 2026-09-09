@@ -215,12 +215,6 @@ one measured live sat at offset 16.
 
 ## Perception and controlled experiments
 
-For the complete acknowledged workflow—from an atomic guest-time timeline to a
-verified, reproducible bundle—see
-[Controlled DOS experiments](docs/CONTROLLED_EXPERIMENTS.md). The exercised
-platform, video-mode and SecondStrike acceptance matrix is recorded in
-[Validation](docs/VALIDATION.md).
-
 Perception tools report measurements, not game meanings. A region is an exact
 connected set of changed pixels; a track is a deterministic association between
 regions in successive transitions. Neither is silently called a player, enemy,
@@ -276,7 +270,7 @@ dosbox_act_and_observe(
 manufacture make/break state by repeatedly filling the BIOS queue. Games that
 read IRQ1, port `0x60`, or their own held-key table may ignore it; the tool says
 so in every result. Use `kind="hold_keys"` with a
-[companion-enabled DOSBox-X build](docs/raw-keyboard.md) for those games.
+companion-enabled DOSBox-X build for those games.
 
 Run independent trials from one baseline by launching with a dedicated state
 directory. The server reserves slot 100 there and restores it before every
@@ -335,8 +329,7 @@ Notebook revisions retain their history and use the explicit statuses
 For auditable work, finalise inputs, timelines, observations, derivations and
 gate records into an experiment bundle. Bundles are immutable, hash every
 artifact, can be verified or reproduced offline, and allow confirmed notebook
-entries to cite exact artifact IDs. See
-[Experiment bundles](docs/EXPERIMENT_BUNDLES.md).
+entries to cite exact artifact IDs.
 
 After camera translation is understood, stitch frames into an indexed world
 mosaic. Supply measured translations or let the tool run the same bounded
